@@ -4,7 +4,13 @@ from sqlalchemy import create_engine, Column, Integer, BigInteger, Text, DateTim
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 
+# --- Vérification critique ---
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError(
+        "❌ La variable d'environnement DATABASE_URL est manquante.\n"
+        "➡️ Dans Railway, assure-toi d'avoir ajouté une base PostgreSQL à ton service."
+    )
 
 engine = create_engine(DATABASE_URL, echo=False)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

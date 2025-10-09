@@ -1,16 +1,22 @@
 # main.py
 import os
 import logging
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
 from db import get_db, UserPreferences
 
-# --- Config ---
+# --- Vérification des variables d'environnement ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # ex: https://mon-bot.up.railway.app/webhook
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # ex: https://ton-bot.up.railway.app/webhook
 
+if not TELEGRAM_TOKEN:
+    raise RuntimeError("❌ Variable manquante : TELEGRAM_BOT_TOKEN")
+if not WEBHOOK_URL:
+    raise RuntimeError("❌ Variable manquante : WEBHOOK_URL")
+
+# --- Logging ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -96,19 +102,29 @@ application.add_handler(CommandHandler("setsuffix", set_suffix))
 application.add_handler(CommandHandler("reset", reset))
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
 
-# --- Webhook endpoint ---
+# --- Webhook setup au démarrage ---
 @app.on_event("startup")
 async def set_webhook():
-    await application.bot.set_webhook(url=WEBHOOK_URL)
-    logger.info(f"Webhook défini sur {WEBHOOK_URL}")
+    try:
+        await application.bot.set_webhook(url=WEBHOOK_URL)
+        logger.info(f"✅ Webhook défini sur {WEBHOOK_URL}")
+    except Exception as e:
+        logger.error(f"❌ Échec de configuration du webhook : {e}")
+        raise
 
+# --- Endpoint Telegram (doit être /webhook) ---
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    update = Update.de_json(await request.json(), application.bot)
-    await application.update_queue.put(update)
-    return {"status": "ok"}
+    try:
+        json_data = await request.json()
+        update = Update.de_json(json_data, application.bot)
+        await application.update_queue.put(update)
+        return {"status": "ok"}
+    except Exception as e:
+        logger.error(f"Erreur dans /webhook : {e}")
+        raise HTTPException(status_code=400, detail="Invalid update")
 
-# --- Point de santé (optionnel mais utile pour Railway) ---
+# --- Santé (GET /) ---
 @app.get("/")
 async def health():
-    return {"status": "alive", "bot": "running"}
+    return {"status": "alive", "webhook_url": WEBHOOK_URL}
