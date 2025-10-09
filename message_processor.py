@@ -1,22 +1,27 @@
 import asyncio
 import logging
-from typing import List, Dict
-from telegram import Message
-from telegram.ext import ContextTypes
-from telegram.error import TelegramError, RetryAfter
-
-from db import get_db, UserPreferences
+from typing import List, Dict, Optional, Callable
+from telegram import Bot
+from telegram.error import TelegramError, RetryAfter, TimedOut
+from db import UserPreferences
 
 logger = logging.getLogger(__name__)
 
 
 class MessageProcessor:
-    """Gestionnaire optimisé pour le traitement massif de messages"""
+    """Gestionnaire ultra-optimisé pour le traitement massif de messages"""
     
-    def __init__(self, max_concurrent: int = 10, rate_limit_delay: float = 0.05):
+    def __init__(self, max_concurrent: int = 15, base_delay: float = 0.05):
         self.max_concurrent = max_concurrent
-        self.rate_limit_delay = rate_limit_delay
+        self.base_delay = base_delay
         self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.processed_count = 0
+        self.failed_count = 0
+        self.total_messages = 0
+        self.is_processing = False
+    
+    def reset_counters(self):
+        """Réinitialise les compteurs"""
         self.processed_count = 0
         self.failed_count = 0
     
@@ -24,22 +29,28 @@ class MessageProcessor:
         self, 
         message_text: str, 
         prefs: UserPreferences,
-        context: ContextTypes.DEFAULT_TYPE,
-        target_chat_id: int = None,
+        bot: Bot,
         retry_count: int = 3
     ) -> Dict:
         """
-        Traite un message unique avec gestion des erreurs et retry
+        Traite un message unique avec retry exponentiel
         
         Returns:
             Dict avec status, processed_text, et error si applicable
         """
         async with self.semaphore:
             try:
+                # Validation
+                if not message_text or not message_text.strip():
+                    return {
+                        "status": "skipped",
+                        "reason": "Message vide"
+                    }
+                
                 # Appliquer les transformations
                 processed_text = message_text
                 
-                # Remplacement de mots-clés
+                # Remplacement de mots-clés (support multi-occurrences)
                 if prefs.keyword_find and prefs.keyword_replace:
                     processed_text = processed_text.replace(
                         prefs.keyword_find, 
@@ -49,20 +60,22 @@ class MessageProcessor:
                 # Ajout préfixe/suffixe
                 processed_text = f"{prefs.prefix}{processed_text}{prefs.suffix}"
                 
-                # Envoi du message
-                chat_id = target_chat_id or prefs.target_chat_id
+                # Validation de la longueur (Telegram limite à 4096 caractères)
+                if len(processed_text) > 4096:
+                    processed_text = processed_text[:4093] + "..."
                 
-                if chat_id:
+                # Envoi du message avec retry exponentiel
+                if prefs.publish_mode and prefs.target_chat_id:
                     attempt = 0
                     while attempt < retry_count:
                         try:
-                            await context.bot.send_message(
-                                chat_id=chat_id,
+                            await bot.send_message(
+                                chat_id=prefs.target_chat_id,
                                 text=processed_text
                             )
                             
                             # Délai anti-rate-limit
-                            await asyncio.sleep(self.rate_limit_delay)
+                            await asyncio.sleep(self.base_delay)
                             
                             self.processed_count += 1
                             return {
@@ -73,31 +86,42 @@ class MessageProcessor:
                         
                         except RetryAfter as e:
                             # Telegram demande d'attendre
-                            wait_time = e.retry_after + 1
-                            logger.warning(f"Rate limit atteint, attente de {wait_time}s")
+                            wait_time = e.retry_after + 2
+                            logger.warning(f"Rate limit: attente de {wait_time}s")
+                            await asyncio.sleep(wait_time)
+                            attempt += 1
+                        
+                        except TimedOut:
+                            # Timeout - retry avec délai exponentiel
+                            wait_time = (2 ** attempt) * self.base_delay
+                            logger.warning(f"Timeout: retry dans {wait_time}s")
                             await asyncio.sleep(wait_time)
                             attempt += 1
                         
                         except TelegramError as e:
-                            if "chat not found" in str(e).lower():
-                                raise  # Ne pas retry si le chat n'existe pas
+                            error_msg = str(e).lower()
+                            if any(x in error_msg for x in ["chat not found", "bot was blocked", "user is deactivated"]):
+                                raise  # Ne pas retry si erreur permanente
+                            
+                            # Retry avec délai exponentiel
+                            wait_time = (2 ** attempt) * self.base_delay
+                            await asyncio.sleep(wait_time)
                             attempt += 1
-                            await asyncio.sleep(1)
                     
                     # Si tous les retries échouent
                     raise Exception(f"Échec après {retry_count} tentatives")
                 
                 else:
-                    # Pas de chat cible défini
+                    # Pas de mode publication - juste transformer
                     return {
-                        "status": "no_target",
+                        "status": "transformed",
                         "processed_text": processed_text,
                         "original_text": message_text
                     }
             
             except Exception as e:
                 self.failed_count += 1
-                logger.error(f"Erreur traitement message: {e}")
+                logger.error(f"Erreur traitement: {e}", exc_info=True)
                 return {
                     "status": "error",
                     "error": str(e),
@@ -107,131 +131,161 @@ class MessageProcessor:
     async def process_batch(
         self,
         messages: List[str],
-        user_id: int,
-        context: ContextTypes.DEFAULT_TYPE,
-        progress_callback = None
+        prefs: UserPreferences,
+        bot: Bot,
+        progress_callback: Optional[Callable] = None
     ) -> Dict:
         """
-        Traite un lot de messages en parallèle
+        Traite un lot de messages en parallèle avec progression
         
         Args:
             messages: Liste des textes à traiter
-            user_id: ID de l'utilisateur
-            context: Contexte Telegram
+            prefs: Préférences utilisateur
+            bot: Instance du bot Telegram
             progress_callback: Fonction appelée pour chaque message traité
         
         Returns:
-            Dict avec statistiques et résultats
+            Dict avec statistiques et résultats détaillés
         """
-        # Récupérer les préférences
-        db = next(get_db())
-        prefs = db.query(UserPreferences).filter(
-            UserPreferences.user_id == user_id
-        ).first()
+        self.reset_counters()
+        self.total_messages = len(messages)
+        self.is_processing = True
         
-        if not prefs:
-            db.close()
+        if not messages:
             return {
                 "status": "error",
-                "error": "Préférences utilisateur introuvables"
+                "error": "Aucun message à traiter"
             }
         
-        # Réinitialiser les compteurs
-        self.processed_count = 0
-        self.failed_count = 0
+        # Validation des préférences
+        if prefs.publish_mode and not prefs.target_chat_id:
+            return {
+                "status": "error",
+                "error": "Mode publication activé mais aucun canal cible défini"
+            }
         
         # Créer les tâches
         tasks = []
-        for idx, msg in enumerate(messages):
+        for msg in messages:
             task = self.process_single_message(
                 message_text=msg,
                 prefs=prefs,
-                context=context
+                bot=bot
             )
             tasks.append(task)
         
         # Exécuter en parallèle avec progression
         results = []
-        for idx, task in enumerate(asyncio.as_completed(tasks)):
+        completed = 0
+        
+        for task in asyncio.as_completed(tasks):
             result = await task
             results.append(result)
+            completed += 1
             
+            # Callback de progression
             if progress_callback:
-                await progress_callback(idx + 1, len(messages), result)
+                try:
+                    await progress_callback(completed, self.total_messages, result)
+                except Exception as e:
+                    logger.error(f"Erreur callback progression: {e}")
         
-        db.close()
+        self.is_processing = False
+        
+        # Calculer les statistiques
+        successful = sum(1 for r in results if r["status"] in ["success", "transformed"])
+        failed = sum(1 for r in results if r["status"] == "error")
+        skipped = sum(1 for r in results if r["status"] == "skipped")
         
         return {
+            "status": "completed",
             "total": len(messages),
-            "successful": self.processed_count,
-            "failed": self.failed_count,
+            "successful": successful,
+            "failed": failed,
+            "skipped": skipped,
             "results": results
         }
     
-    async def process_forwarded_messages(
-        self,
-        user_id: int,
-        forwarded_messages: List[Message],
-        context: ContextTypes.DEFAULT_TYPE,
-        progress_callback = None
-    ) -> Dict:
-        """
-        Traite des messages forwardés en extrayant leur texte
-        """
-        # Extraire le texte de chaque message
-        message_texts = []
-        for msg in forwarded_messages:
-            if msg.text:
-                message_texts.append(msg.text)
-            elif msg.caption:
-                message_texts.append(msg.caption)
-        
-        if not message_texts:
-            return {
-                "status": "error",
-                "error": "Aucun texte trouvé dans les messages"
-            }
-        
-        return await self.process_batch(
-            messages=message_texts,
-            user_id=user_id,
-            context=context,
-            progress_callback=progress_callback
-        )
+    def get_progress_percentage(self) -> float:
+        """Retourne le pourcentage de progression"""
+        if self.total_messages == 0:
+            return 0.0
+        return (self.processed_count + self.failed_count) / self.total_messages * 100
 
 
-# Instance globale pour réutilisation
-message_processor = MessageProcessor(max_concurrent=20, rate_limit_delay=0.03)
+# Instance globale optimisée
+message_processor = MessageProcessor(max_concurrent=15, base_delay=0.05)
 
 
 async def handle_bulk_processing(
-    user_id: int,
     messages: List[str],
-    context: ContextTypes.DEFAULT_TYPE,
-    status_message = None
-):
+    prefs: UserPreferences,
+    bot: Bot,
+    status_message=None
+) -> Dict:
     """
-    Fonction helper pour le traitement bulk avec mise à jour du statut
+    Helper pour le traitement bulk avec mise à jour du statut
+    
+    Args:
+        messages: Liste des messages à traiter
+        prefs: Préférences utilisateur
+        bot: Instance du bot
+        status_message: Message Telegram à mettre à jour
+    
+    Returns:
+        Dict avec les résultats du traitement
     """
+    last_update = 0
+    
     async def update_progress(current: int, total: int, result: Dict):
-        if status_message and current % 5 == 0:  # Mise à jour tous les 5 messages
+        nonlocal last_update
+        
+        # Mise à jour tous les 3 messages ou si terminé
+        if status_message and (current - last_update >= 3 or current == total):
             try:
-                progress_bar = "▓" * (current * 20 // total) + "░" * (20 - (current * 20 // total))
-                await status_message.edit_text(
-                    f"⚙️ <b>Traitement en cours...</b>\n\n"
-                    f"[{progress_bar}] {current}/{total}\n"
+                progress_pct = (current / total) * 100
+                bar_length = 20
+                filled = int(bar_length * current / total)
+                bar = "▓" * filled + "░" * (bar_length - filled)
+                
+                status_emoji = "⚙️" if current < total else "✅"
+                
+                text = (
+                    f"{status_emoji} <b>Traitement en cours...</b>\n\n"
+                    f"[{bar}] {progress_pct:.1f}%\n"
+                    f"📊 {current}/{total} messages\n\n"
                     f"✅ Réussis: {message_processor.processed_count}\n"
-                    f"❌ Échecs: {message_processor.failed_count}",
-                    parse_mode="HTML"
+                    f"❌ Échecs: {message_processor.failed_count}"
                 )
+                
+                await status_message.edit_text(text, parse_mode="HTML")
+                last_update = current
             except Exception as e:
-                logger.error(f"Erreur mise à jour progression: {e}")
+                logger.error(f"Erreur MAJ progression: {e}")
     
     result = await message_processor.process_batch(
         messages=messages,
-        user_id=user_id,
-        context=context,
+        prefs=prefs,
+        bot=bot,
         progress_callback=update_progress
     )
     
     return result
+
+
+def validate_chat_id(chat_id_str: str) -> Optional[int]:
+    """
+    Valide et convertit un chat_id
+    
+    Returns:
+        int si valide, None sinon
+    """
+    try:
+        chat_id = int(chat_id_str.strip())
+        # Les IDs de groupe/canal sont négatifs
+        # Les IDs de supergroupe commencent par -100
+        if chat_id < 0 or (chat_id > 0 and len(str(chat_id)) >= 9):
+            return chat_id
+        return None
+    except (ValueError, AttributeError):
+        return None

@@ -1,356 +1,445 @@
 import logging
-from telegram import Update, InputMediaPhoto
-from telegram.ext import ContextTypes, ConversationHandler
+from telegram import Update
+from telegram.ext import ContextTypes
 from telegram.error import TelegramError
 
-from db import get_db, UserPreferences
-from keyboards import (
-    get_main_menu, get_prefix_menu, get_suffix_menu,
-    get_keyword_menu, get_publish_menu, get_cancel_keyboard,
-    get_confirm_reset_keyboard
+from db import (
+    get_db, UserPreferences, get_or_create_user, 
+    clear_buffer, get_buffer_messages, add_to_buffer,
+    update_user_activity
 )
+from keyboards import *
+from message_processor import handle_bulk_processing, validate_chat_id
 
 logger = logging.getLogger(__name__)
 
 # États pour les conversations
-WAITING_PREFIX = 1
-WAITING_SUFFIX = 2
-WAITING_KEYWORD_FIND = 3
-WAITING_KEYWORD_REPLACE = 4
-WAITING_TARGET_CHAT = 5
+WAITING_PREFIX = "waiting_prefix"
+WAITING_SUFFIX = "waiting_suffix"
+WAITING_KEYWORD_FIND = "waiting_keyword_find"
+WAITING_KEYWORD_REPLACE = "waiting_keyword_replace"
+WAITING_TARGET_CHAT = "waiting_target_chat"
 
-
-# --- Images pour le menu principal (URLs d'exemple) ---
-WELCOME_IMAGES = [
-    "https://images.unsplash.com/photo-1611162617474-5b21e879e113?w=400",
-    "https://images.unsplash.com/photo-1614680376593-902f74cf0d41?w=400",
-    "https://images.unsplash.com/photo-1614680376408-81e91ffe3db7?w=400"
-]
+# Images de bienvenue robustes (base64 ou URLs stables)
+WELCOME_IMAGE = "https://images.unsplash.com/photo-1614680376593-902f74cf0d41?w=800&q=80"
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Commande /start avec image et menu interactif"""
+    """Commande /start avec interface complète"""
     user = update.effective_user
+    user_id = user.id
     
-    # Créer ou récupérer les préférences
-    db = next(get_db())
-    prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user.id).first()
-    if not prefs:
-        prefs = UserPreferences(user_id=user.id)
-        db.add(prefs)
-        db.commit()
-    db.close()
+    # Créer ou récupérer l'utilisateur
+    with get_db() as db:
+        prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
+        if not prefs:
+            prefs = UserPreferences(user_id=user_id)
+            db.add(prefs)
+            is_new_user = True
+        else:
+            is_new_user = False
+        
+        # Reset conversation state
+        prefs.conversation_state = ""
+        prefs.buffer_mode = False
     
     welcome_text = (
         f"👋 <b>Bienvenue {user.first_name}!</b>\n\n"
-        "🤖 <b>Bot de Messagerie Avancé</b>\n\n"
+        "🤖 <b>Bot de Messagerie Avancé v2.0</b>\n\n"
         "✨ <b>Fonctionnalités:</b>\n"
-        "• Ajout de préfixe/suffixe\n"
-        "• Remplacement de mots-clés\n"
-        "• Publication automatique vers canal\n"
-        "• Traitement massif (100+ messages)\n\n"
-        "📋 Sélectionnez une option ci-dessous:"
+        "• 📝 Ajout de préfixe/suffixe automatique\n"
+        "• 🔄 Remplacement de mots-clés intelligent\n"
+        "• 📢 Publication automatique vers canal\n"
+        "• ⚡ Traitement massif (100+ messages)\n"
+        "• 📊 Statistiques détaillées\n\n"
+        "💡 <b>Commandes rapides:</b>\n"
+        "/start - Afficher ce menu\n"
+        "/stats - Voir vos statistiques\n"
+        "/reset - Tout réinitialiser\n\n"
+        "📋 <b>Sélectionnez une option ci-dessous:</b>"
     )
     
     try:
-        # Envoyer une image aléatoire avec le menu
-        import random
-        photo_url = random.choice(WELCOME_IMAGES)
-        
         await update.message.reply_photo(
-            photo=photo_url,
+            photo=WELCOME_IMAGE,
             caption=welcome_text,
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(show_tutorial=is_new_user),
             parse_mode="HTML"
         )
     except Exception as e:
         logger.error(f"Erreur envoi image: {e}")
         await update.message.reply_text(
             welcome_text,
-            reply_markup=get_main_menu(),
+            reply_markup=get_main_menu(show_tutorial=is_new_user),
             parse_mode="HTML"
         )
+    
+    update_user_activity(user_id)
 
 
 async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gestionnaire pour tous les boutons inline"""
+    """Gestionnaire universel pour tous les boutons inline"""
     query = update.callback_query
     await query.answer()
     
     user_id = update.effective_user.id
     data = query.data
     
-    db = next(get_db())
-    prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
-    if not prefs:
-        prefs = UserPreferences(user_id=user_id)
-        db.add(prefs)
-        db.commit()
-        db.refresh(prefs)
+    # Ignorer les boutons non-op
+    if data == "noop":
+        return
     
-    # Navigation dans les menus
-    if data == "menu_main":
-        text = "📋 <b>Menu Principal</b>\n\nSélectionnez une option:"
-        await query.edit_message_caption(
-            caption=text,
-            reply_markup=get_main_menu(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "menu_prefix":
-        text = "📝 <b>Gestion du Préfixe</b>\n\n"
-        if prefs.prefix:
-            text += f"Préfixe actuel: <code>{prefs.prefix}</code>"
-        else:
-            text += "Aucun préfixe défini"
-        await query.edit_message_caption(
-            caption=text,
-            reply_markup=get_prefix_menu(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "menu_suffix":
-        text = "📌 <b>Gestion du Suffixe</b>\n\n"
-        if prefs.suffix:
-            text += f"Suffixe actuel: <code>{prefs.suffix}</code>"
-        else:
-            text += "Aucun suffixe défini"
-        await query.edit_message_caption(
-            caption=text,
-            reply_markup=get_suffix_menu(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "menu_keyword":
-        text = "🔄 <b>Remplacement de Mots-clés</b>\n\n"
-        if prefs.keyword_find:
-            text += f"Chercher: <code>{prefs.keyword_find}</code>\n"
-            text += f"Remplacer par: <code>{prefs.keyword_replace}</code>"
-        else:
-            text += "Aucun remplacement défini"
-        await query.edit_message_caption(
-            caption=text,
-            reply_markup=get_keyword_menu(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "menu_publish":
-        text = "📢 <b>Mode Publication</b>\n\n"
-        if prefs.publish_mode:
-            text += f"✅ Activé\nCanal cible: <code>{prefs.target_chat_id}</code>"
-        else:
-            text += "❌ Désactivé"
-        await query.edit_message_caption(
-            caption=text,
-            reply_markup=get_publish_menu(prefs.publish_mode),
-            parse_mode="HTML"
-        )
-    
-    elif data == "menu_status":
-        text = "ℹ️ <b>État de vos paramètres</b>\n\n"
-        text += f"📝 Préfixe: <code>{prefs.prefix or '(vide)'}</code>\n"
-        text += f"📌 Suffixe: <code>{prefs.suffix or '(vide)'}</code>\n"
-        text += f"🔍 Mot à remplacer: <code>{prefs.keyword_find or '(vide)'}</code>\n"
-        text += f"✨ Remplacer par: <code>{prefs.keyword_replace or '(vide)'}</code>\n"
-        text += f"📢 Mode publication: {'✅ Activé' if prefs.publish_mode else '❌ Désactivé'}\n"
-        if prefs.target_chat_id:
-            text += f"📍 Canal cible: <code>{prefs.target_chat_id}</code>"
-        await query.edit_message_caption(
-            caption=text,
-            reply_markup=get_main_menu(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "menu_reset":
-        text = "⚠️ <b>Réinitialisation</b>\n\nÊtes-vous sûr de vouloir réinitialiser tous vos paramètres?"
-        await query.edit_message_caption(
-            caption=text,
-            reply_markup=get_confirm_reset_keyboard(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "confirm_reset":
-        prefs.prefix = ""
-        prefs.suffix = ""
-        prefs.keyword_find = ""
-        prefs.keyword_replace = ""
-        prefs.publish_mode = False
-        prefs.target_chat_id = None
-        db.commit()
+    with get_db() as db:
+        prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
+        if not prefs:
+            prefs = UserPreferences(user_id=user_id)
+            db.add(prefs)
+            db.flush()
         
-        text = "✅ <b>Réinitialisation réussie!</b>\n\nTous vos paramètres ont été supprimés."
-        await query.edit_message_caption(
-            caption=text,
-            reply_markup=get_main_menu(),
-            parse_mode="HTML"
-        )
+        # Navigation dans les menus
+        if data == "menu_main":
+            prefs.conversation_state = ""
+            text = "📋 <b>Menu Principal</b>\n\nSélectionnez une option:"
+            await safe_edit_message(query, text, get_main_menu(), parse_mode="HTML")
+        
+        elif data == "menu_keyword":
+            text = "🔄 <b>Remplacement de Mots-clés</b>\n\n"
+            if prefs.keyword_find:
+                text += f"🔍 Chercher: <code>{prefs.keyword_find}</code>\n"
+                text += f"✨ Remplacer par: <code>{prefs.keyword_replace}</code>\n\n"
+                text += "Chaque occurrence sera remplacée automatiquement."
+            else:
+                text += "Aucun remplacement défini."
+            await safe_edit_message(query, text, get_keyword_menu(prefs.keyword_find, prefs.keyword_replace), parse_mode="HTML")
+        
+        elif data == "menu_publish":
+            text = "📢 <b>Mode Publication</b>\n\n"
+            if prefs.publish_mode:
+                text += f"✅ <b>Activé</b>\n"
+                text += f"📍 Canal: <code>{prefs.target_chat_id}</code>\n\n"
+                text += "Vos messages seront publiés dans le canal."
+            else:
+                text += "❌ <b>Désactivé</b>\n\n"
+                text += "Activez ce mode pour publier automatiquement."
+            await safe_edit_message(query, text, get_publish_menu(prefs.publish_mode, str(prefs.target_chat_id) if prefs.target_chat_id else ""), parse_mode="HTML")
+        
+        elif data == "menu_bulk":
+            buffer_count = len(get_buffer_messages(user_id))
+            text = "⚡ <b>Traitement Massif</b>\n\n"
+            if prefs.buffer_mode:
+                text += f"🟢 Mode actif\n"
+                text += f"📊 {buffer_count} messages en attente\n\n"
+                text += "Envoyez vos messages, ils seront bufferisés."
+            else:
+                text += "⚪ Mode inactif\n\n"
+                text += "Activez pour accumuler des messages avant traitement."
+            await safe_edit_message(query, text, get_bulk_menu(prefs.buffer_mode, buffer_count), parse_mode="HTML")
+        
+        elif data == "menu_stats":
+            text = "📊 <b>Vos Statistiques</b>\n\n"
+            text += f"👤 User ID: <code>{user_id}</code>\n"
+            text += f"📅 Membre depuis: {prefs.created_at.strftime('%d/%m/%Y')}\n"
+            text += f"🕐 Dernière activité: {prefs.last_activity.strftime('%d/%m/%Y %H:%M')}\n\n"
+            text += f"📈 Messages traités: <b>{prefs.messages_processed}</b>\n"
+            text += f"❌ Échecs: <b>{prefs.messages_failed}</b>\n\n"
+            
+            success_rate = 0
+            if prefs.messages_processed + prefs.messages_failed > 0:
+                success_rate = (prefs.messages_processed / (prefs.messages_processed + prefs.messages_failed)) * 100
+            text += f"✅ Taux de réussite: <b>{success_rate:.1f}%</b>"
+            await safe_edit_message(query, text, get_main_menu(), parse_mode="HTML")
+        
+        elif data == "menu_status":
+            text = "ℹ️ <b>État de vos paramètres</b>\n\n"
+            text += f"📝 Préfixe: <code>{prefs.prefix or '(vide)'}</code>\n"
+            text += f"📌 Suffixe: <code>{prefs.suffix or '(vide)'}</code>\n"
+            text += f"🔍 Chercher: <code>{prefs.keyword_find or '(vide)'}</code>\n"
+            text += f"✨ Remplacer par: <code>{prefs.keyword_replace or '(vide)'}</code>\n"
+            text += f"📢 Publication: {'✅ Activé' if prefs.publish_mode else '❌ Désactivé'}\n"
+            if prefs.target_chat_id:
+                text += f"📍 Canal: <code>{prefs.target_chat_id}</code>\n"
+            text += f"⚡ Buffer: {'🟢 Actif' if prefs.buffer_mode else '⚪ Inactif'}"
+            await safe_edit_message(query, text, get_main_menu(), parse_mode="HTML")
+        
+        elif data == "menu_reset":
+            text = "⚠️ <b>Réinitialisation Complète</b>\n\n"
+            text += "Cette action va supprimer:\n"
+            text += "• Tous vos paramètres\n"
+            text += "• Votre buffer de messages\n"
+            text += "• Vos statistiques ne seront PAS effacées\n\n"
+            text += "<b>Cette action est irréversible!</b>"
+            await safe_edit_message(query, text, get_confirm_reset_keyboard(), parse_mode="HTML")
+        
+        elif data == "confirm_reset":
+            prefs.prefix = ""
+            prefs.suffix = ""
+            prefs.keyword_find = ""
+            prefs.keyword_replace = ""
+            prefs.publish_mode = False
+            prefs.target_chat_id = None
+            prefs.buffer_mode = False
+            prefs.conversation_state = ""
+            clear_buffer(user_id)
+            
+            text = "✅ <b>Réinitialisation réussie!</b>\n\n"
+            text += "Tous vos paramètres ont été supprimés.\n"
+            text += "Vos statistiques sont conservées."
+            await safe_edit_message(query, text, get_main_menu(), parse_mode="HTML")
+        
+        # Actions de définition
+        elif data == "set_prefix":
+            prefs.conversation_state = WAITING_PREFIX
+            text = "✏️ <b>Définir le préfixe</b>\n\n"
+            text += "Envoyez le texte à utiliser comme préfixe.\n"
+            text += "Exemple: <code>[PROMO] </code>"
+            await safe_edit_message(query, text, get_cancel_keyboard(), parse_mode="HTML")
+        
+        elif data == "set_suffix":
+            prefs.conversation_state = WAITING_SUFFIX
+            text = "✏️ <b>Définir le suffixe</b>\n\n"
+            text += "Envoyez le texte à utiliser comme suffixe.\n"
+            text += "Exemple: <code> - Urgent!</code>"
+            await safe_edit_message(query, text, get_cancel_keyboard(), parse_mode="HTML")
+        
+        elif data == "set_keyword_find":
+            prefs.conversation_state = WAITING_KEYWORD_FIND
+            text = "🔍 <b>Mot à remplacer</b>\n\n"
+            text += "Envoyez le mot ou phrase à détecter.\n"
+            text += "Exemple: <code>prix</code>"
+            await safe_edit_message(query, text, get_cancel_keyboard(), parse_mode="HTML")
+        
+        elif data == "set_keyword_replace":
+            prefs.conversation_state = WAITING_KEYWORD_REPLACE
+            text = "✨ <b>Texte de remplacement</b>\n\n"
+            text += "Envoyez le texte qui remplacera le mot-clé.\n"
+            text += "Exemple: <code>tarif exclusif</code>"
+            await safe_edit_message(query, text, get_cancel_keyboard(), parse_mode="HTML")
+        
+        elif data == "set_target_chat":
+            prefs.conversation_state = WAITING_TARGET_CHAT
+            text = "📍 <b>Définir le canal cible</b>\n\n"
+            text += "Envoyez l'ID du canal/groupe.\n"
+            text += "Exemple: <code>-1001234567890</code>\n\n"
+            text += "💡 <b>Comment obtenir l'ID:</b>\n"
+            text += "1. Ajoutez @userinfobot à votre canal\n"
+            text += "2. Forwardez un message du canal\n"
+            text += "3. Le bot vous donnera l'ID"
+            await safe_edit_message(query, text, get_cancel_keyboard(), parse_mode="HTML")
+        
+        # Actions de suppression
+        elif data == "clear_prefix":
+            prefs.prefix = ""
+            text = "✅ <b>Préfixe supprimé</b>"
+            await safe_edit_message(query, text, get_prefix_menu(""), parse_mode="HTML")
+        
+        elif data == "clear_suffix":
+            prefs.suffix = ""
+            text = "✅ <b>Suffixe supprimé</b>"
+            await safe_edit_message(query, text, get_suffix_menu(""), parse_mode="HTML")
+        
+        elif data == "clear_keyword":
+            prefs.keyword_find = ""
+            prefs.keyword_replace = ""
+            text = "✅ <b>Remplacement supprimé</b>"
+            await safe_edit_message(query, text, get_keyword_menu("", ""), parse_mode="HTML")
+        
+        # Toggle actions
+        elif data == "toggle_publish":
+            prefs.publish_mode = not prefs.publish_mode
+            status = "activé ✅" if prefs.publish_mode else "désactivé ❌"
+            
+            if prefs.publish_mode and not prefs.target_chat_id:
+                text = "⚠️ <b>Attention!</b>\n\nMode publication activé mais aucun canal cible défini.\n\nVeuillez définir un canal."
+            else:
+                text = f"📢 <b>Mode publication {status}</b>"
+            
+            await safe_edit_message(query, text, get_publish_menu(prefs.publish_mode, str(prefs.target_chat_id) if prefs.target_chat_id else ""), parse_mode="HTML")
+        
+        elif data == "toggle_bulk":
+            prefs.buffer_mode = not prefs.buffer_mode
+            
+            if not prefs.buffer_mode:
+                clear_buffer(user_id)
+            
+            buffer_count = len(get_buffer_messages(user_id))
+            status = "activé 🟢" if prefs.buffer_mode else "désactivé ⚪"
+            text = f"⚡ <b>Mode buffer {status}</b>\n\n"
+            
+            if prefs.buffer_mode:
+                text += "Envoyez vos messages, ils seront bufferisés.\n"
+                text += "Revenez ici pour les traiter tous ensemble."
+            else:
+                text += "Les nouveaux messages seront traités normalement."
+            
+            await safe_edit_message(query, text, get_bulk_menu(prefs.buffer_mode, buffer_count), parse_mode="HTML")
+        
+        elif data == "clear_bulk":
+            clear_buffer(user_id)
+            text = "✅ <b>Buffer vidé</b>\n\nTous les messages en attente ont été supprimés."
+            await safe_edit_message(query, text, get_bulk_menu(prefs.buffer_mode, 0), parse_mode="HTML")
+        
+        elif data == "process_bulk":
+            messages = get_buffer_messages(user_id)
+            
+            if not messages:
+                text = "❌ <b>Aucun message à traiter</b>"
+                await safe_edit_message(query, text, get_bulk_menu(prefs.buffer_mode, 0), parse_mode="HTML")
+                return
+            
+            # Envoyer un message de statut
+            status_msg = await query.message.reply_text(
+                f"⚙️ <b>Traitement de {len(messages)} messages...</b>\n\nInitialisation...",
+                parse_mode="HTML"
+            )
+            
+            # Traiter les messages
+            result = await handle_bulk_processing(
+                messages=messages,
+                prefs=prefs,
+                bot=context.bot,
+                status_message=status_msg
+            )
+            
+            # Mettre à jour les statistiques
+            prefs.messages_processed += result.get('successful', 0)
+            prefs.messages_failed += result.get('failed', 0)
+            
+            # Vider le buffer
+            clear_buffer(user_id)
+            prefs.buffer_mode = False
+            
+            # Message final
+            await status_msg.edit_text(
+                f"✅ <b>Traitement terminé!</b>\n\n"
+                f"📊 Total: {result['total']}\n"
+                f"✅ Réussis: {result['successful']}\n"
+                f"❌ Échecs: {result['failed']}\n"
+                f"⏭️ Ignorés: {result.get('skipped', 0)}\n\n"
+                f"Mode buffer désactivé automatiquement.",
+                parse_mode="HTML"
+            )
+        
+        elif data == "test_publish":
+            if not prefs.target_chat_id:
+                text = "❌ <b>Aucun canal cible défini</b>\n\nVeuillez d'abord définir un canal."
+                await safe_edit_message(query, text, get_publish_menu(prefs.publish_mode, ""), parse_mode="HTML")
+                return
+            
+            test_message = f"🧪 Test du bot\nUtilisateur: {user_id}\nHeure: {prefs.last_activity.strftime('%H:%M:%S')}"
+            
+            try:
+                await context.bot.send_message(
+                    chat_id=prefs.target_chat_id,
+                    text=test_message
+                )
+                text = "✅ <b>Test réussi!</b>\n\nLe message a été envoyé au canal."
+                await safe_edit_message(query, text, get_test_result_keyboard(), parse_mode="HTML")
+            except TelegramError as e:
+                text = f"❌ <b>Échec du test</b>\n\nErreur: {str(e)}\n\nVérifiez que:\n• L'ID est correct\n• Le bot est administrateur"
+                await safe_edit_message(query, text, get_test_result_keyboard(), parse_mode="HTML")
+        
+        elif data.startswith("tutorial_"):
+            page = int(data.split("_")[1])
+            await show_tutorial(query, page)
+        
+        elif data == "show_tutorial":
+            await show_tutorial(query, 1)
     
-    # Actions de définition
-    elif data == "set_prefix":
-        context.user_data['awaiting'] = WAITING_PREFIX
-        await query.edit_message_caption(
-            caption="✏️ <b>Définir le préfixe</b>\n\nEnvoyez le texte à utiliser comme préfixe:",
-            reply_markup=get_cancel_keyboard(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "set_suffix":
-        context.user_data['awaiting'] = WAITING_SUFFIX
-        await query.edit_message_caption(
-            caption="✏️ <b>Définir le suffixe</b>\n\nEnvoyez le texte à utiliser comme suffixe:",
-            reply_markup=get_cancel_keyboard(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "set_keyword_find":
-        context.user_data['awaiting'] = WAITING_KEYWORD_FIND
-        await query.edit_message_caption(
-            caption="🔍 <b>Mot à remplacer</b>\n\nEnvoyez le mot ou phrase à détecter:",
-            reply_markup=get_cancel_keyboard(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "set_keyword_replace":
-        context.user_data['awaiting'] = WAITING_KEYWORD_REPLACE
-        await query.edit_message_caption(
-            caption="✨ <b>Texte de remplacement</b>\n\nEnvoyez le texte qui remplacera le mot-clé:",
-            reply_markup=get_cancel_keyboard(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "set_target_chat":
-        context.user_data['awaiting'] = WAITING_TARGET_CHAT
-        await query.edit_message_caption(
-            caption="📍 <b>Canal cible</b>\n\nEnvoyez l'ID du canal/groupe (ex: -1001234567890)\n\n"
-                   "💡 Pour obtenir l'ID: ajoutez @userinfobot à votre canal",
-            reply_markup=get_cancel_keyboard(),
-            parse_mode="HTML"
-        )
-    
-    # Actions de suppression
-    elif data == "clear_prefix":
-        prefs.prefix = ""
-        db.commit()
-        await query.edit_message_caption(
-            caption="✅ <b>Préfixe supprimé</b>",
-            reply_markup=get_prefix_menu(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "clear_suffix":
-        prefs.suffix = ""
-        db.commit()
-        await query.edit_message_caption(
-            caption="✅ <b>Suffixe supprimé</b>",
-            reply_markup=get_suffix_menu(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "clear_keyword":
-        prefs.keyword_find = ""
-        prefs.keyword_replace = ""
-        db.commit()
-        await query.edit_message_caption(
-            caption="✅ <b>Remplacement supprimé</b>",
-            reply_markup=get_keyword_menu(),
-            parse_mode="HTML"
-        )
-    
-    elif data == "toggle_publish":
-        prefs.publish_mode = not prefs.publish_mode
-        db.commit()
-        status = "activé ✅" if prefs.publish_mode else "désactivé ❌"
-        text = f"📢 <b>Mode publication {status}</b>"
-        await query.edit_message_caption(
-            caption=text,
-            reply_markup=get_publish_menu(prefs.publish_mode),
-            parse_mode="HTML"
-        )
-    
-    db.close()
+    update_user_activity(user_id)
 
 
 async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gestion des entrées textuelles selon le contexte"""
+    """Gestion intelligente des entrées textuelles"""
     user_id = update.effective_user.id
     text = update.message.text
     
-    # Vérifier si on attend une entrée spécifique
-    awaiting = context.user_data.get('awaiting')
-    
-    if awaiting:
-        db = next(get_db())
+    with get_db() as db:
         prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
+        if not prefs:
+            prefs = UserPreferences(user_id=user_id)
+            db.add(prefs)
+            db.flush()
         
-        if awaiting == WAITING_PREFIX:
+        # Vérifier si on attend une entrée spécifique
+        state = prefs.conversation_state
+        
+        if state == WAITING_PREFIX:
             prefs.prefix = text
-            db.commit()
+            prefs.conversation_state = ""
             await update.message.reply_text(
-                f"✅ <b>Préfixe défini:</b> <code>{text}</code>",
+                f"✅ <b>Préfixe défini:</b>\n<code>{text}</code>\n\nTous vos messages commenceront par ce texte.",
                 parse_mode="HTML"
             )
         
-        elif awaiting == WAITING_SUFFIX:
+        elif state == WAITING_SUFFIX:
             prefs.suffix = text
-            db.commit()
+            prefs.conversation_state = ""
             await update.message.reply_text(
-                f"✅ <b>Suffixe défini:</b> <code>{text}</code>",
+                f"✅ <b>Suffixe défini:</b>\n<code>{text}</code>\n\nTous vos messages se termineront par ce texte.",
                 parse_mode="HTML"
             )
         
-        elif awaiting == WAITING_KEYWORD_FIND:
+        elif state == WAITING_KEYWORD_FIND:
             prefs.keyword_find = text
-            db.commit()
+            prefs.conversation_state = ""
             await update.message.reply_text(
-                f"✅ <b>Mot-clé défini:</b> <code>{text}</code>",
+                f"✅ <b>Mot-clé défini:</b>\n<code>{text}</code>\n\nToutes les occurrences seront remplacées.",
                 parse_mode="HTML"
             )
         
-        elif awaiting == WAITING_KEYWORD_REPLACE:
+        elif state == WAITING_KEYWORD_REPLACE:
             prefs.keyword_replace = text
-            db.commit()
+            prefs.conversation_state = ""
             await update.message.reply_text(
-                f"✅ <b>Remplacement défini:</b> <code>{text}</code>",
+                f"✅ <b>Remplacement défini:</b>\n<code>{text}</code>\n\nLe mot-clé sera remplacé par ce texte.",
                 parse_mode="HTML"
             )
         
-        elif awaiting == WAITING_TARGET_CHAT:
-            try:
-                chat_id = int(text)
+        elif state == WAITING_TARGET_CHAT:
+            chat_id = validate_chat_id(text)
+            if chat_id:
                 prefs.target_chat_id = chat_id
-                db.commit()
+                prefs.conversation_state = ""
                 await update.message.reply_text(
-                    f"✅ <b>Canal cible défini:</b> <code>{chat_id}</code>",
+                    f"✅ <b>Canal cible défini:</b>\n<code>{chat_id}</code>\n\n"
+                    f"💡 Testez avec le bouton 'Tester l'envoi' dans le menu.",
                     parse_mode="HTML"
                 )
-            except ValueError:
+            else:
                 await update.message.reply_text(
-                    "❌ <b>Erreur:</b> ID invalide. Envoyez un nombre (ex: -1001234567890)",
+                    "❌ <b>ID invalide</b>\n\n"
+                    "L'ID doit être un nombre (généralement négatif pour les groupes).\n"
+                    "Exemple: <code>-1001234567890</code>",
                     parse_mode="HTML"
                 )
-                db.close()
-                return
         
-        context.user_data['awaiting'] = None
-        db.close()
-    else:
-        # Traitement normal du message
-        await process_message(update, context)
+        # Mode buffer activé
+        elif prefs.buffer_mode:
+            add_to_buffer(user_id, text)
+            buffer_count = len(get_buffer_messages(user_id))
+            
+            if buffer_count >= 100:
+                await update.message.reply_text(
+                    f"⚠️ <b>Limite atteinte!</b>\n\n"
+                    f"Vous avez 100 messages en attente.\n"
+                    f"Retournez au menu pour les traiter.",
+                    parse_mode="HTML"
+                )
+            else:
+                await update.message.reply_text(
+                    f"✅ Message {buffer_count}/100 ajouté au buffer"
+                )
+        
+        # Traitement normal
+        else:
+            await process_normal_message(update, context, prefs)
+    
+    update_user_activity(user_id)
 
 
-async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Traite les messages avec les transformations définies"""
-    user_id = update.effective_user.id
+async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_TYPE, prefs: UserPreferences):
+    """Traite un message normalement (hors buffer)"""
     text = update.message.text
-    
-    db = next(get_db())
-    prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
-    
-    if not prefs:
-        prefs = UserPreferences(user_id=user_id)
-        db.add(prefs)
-        db.commit()
-        db.refresh(prefs)
     
     # Appliquer les transformations
     processed_text = text
@@ -362,6 +451,10 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Ajout préfixe/suffixe
     processed_text = f"{prefs.prefix}{processed_text}{prefs.suffix}"
     
+    # Limiter la longueur
+    if len(processed_text) > 4096:
+        processed_text = processed_text[:4093] + "..."
+    
     # Mode publication
     if prefs.publish_mode and prefs.target_chat_id:
         try:
@@ -370,14 +463,222 @@ async def process_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 text=processed_text
             )
             await update.message.reply_text("✅ Message publié dans le canal!")
+            
+            with get_db() as db:
+                user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
+                if user_prefs:
+                    user_prefs.messages_processed += 1
+        
         except TelegramError as e:
             logger.error(f"Erreur publication: {e}")
             await update.message.reply_text(
-                f"❌ Erreur lors de la publication:\n{str(e)}\n\n"
-                "Vérifiez que le bot est administrateur du canal."
+                f"❌ <b>Erreur lors de la publication:</b>\n{str(e)}\n\n"
+                "Vérifiez que le bot est administrateur du canal.",
+                parse_mode="HTML"
             )
+            
+            with get_db() as db:
+                user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
+                if user_prefs:
+                    user_prefs.messages_failed += 1
     else:
         # Réponse dans le même chat
         await update.message.reply_text(processed_text)
+        
+        with get_db() as db:
+            user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
+            if user_prefs:
+                user_prefs.messages_processed += 1
+
+
+async def safe_edit_message(query, text: str, markup, **kwargs):
+    """Édite un message de manière sécurisée"""
+    try:
+        # Essayer d'éditer le caption (si c'est une photo)
+        await query.edit_message_caption(
+            caption=text,
+            reply_markup=markup,
+            **kwargs
+        )
+    except:
+        try:
+            # Sinon éditer le texte
+            await query.edit_message_text(
+                text=text,
+                reply_markup=markup,
+                **kwargs
+            )
+        except Exception as e:
+            logger.error(f"Erreur édition message: {e}")
+
+
+async def show_tutorial(query, page: int):
+    """Affiche le tutoriel page par page"""
+    tutorials = {
+        1: (
+            "📖 <b>Tutoriel - Page 1/5</b>\n\n"
+            "<b>🎯 Préfixe et Suffixe</b>\n\n"
+            "Le préfixe est ajouté au début de vos messages.\n"
+            "Le suffixe à la fin.\n\n"
+            "<b>Exemple:</b>\n"
+            "Préfixe: <code>[PROMO] </code>\n"
+            "Suffixe: <code> - Offre limitée!</code>\n\n"
+            "Message: <code>Nouveau produit</code>\n"
+            "Résultat: <code>[PROMO] Nouveau produit - Offre limitée!</code>"
+        ),
+        2: (
+            "📖 <b>Tutoriel - Page 2/5</b>\n\n"
+            "<b>🔄 Remplacement de Mots-clés</b>\n\n"
+            "Remplacez automatiquement des mots ou phrases.\n\n"
+            "<b>Exemple:</b>\n"
+            "Chercher: <code>acheter</code>\n"
+            "Remplacer: <code>réserver maintenant</code>\n\n"
+            "Message: <code>Venez acheter ce produit</code>\n"
+            "Résultat: <code>Venez réserver maintenant ce produit</code>"
+        ),
+        3: (
+            "📖 <b>Tutoriel - Page 3/5</b>\n\n"
+            "<b>📢 Mode Publication</b>\n\n"
+            "Publiez automatiquement dans un canal/groupe.\n\n"
+            "<b>Étapes:</b>\n"
+            "1. Obtenez l'ID du canal (avec @userinfobot)\n"
+            "2. Définissez le canal cible\n"
+            "3. Ajoutez le bot comme administrateur\n"
+            "4. Activez le mode publication\n"
+            "5. Testez l'envoi\n\n"
+            "Vos messages seront publiés automatiquement!"
+        ),
+        4: (
+            "📖 <b>Tutoriel - Page 4/5</b>\n\n"
+            "<b>⚡ Traitement Massif</b>\n\n"
+            "Traitez jusqu'à 100 messages d'un coup!\n\n"
+            "<b>Utilisation:</b>\n"
+            "1. Activez le mode buffer\n"
+            "2. Envoyez vos messages (jusqu'à 100)\n"
+            "3. Cliquez sur 'Traiter tout'\n"
+            "4. Le bot traite tout en parallèle\n\n"
+            "Parfait pour les envois massifs!"
+        ),
+        5: (
+            "📖 <b>Tutoriel - Page 5/5</b>\n\n"
+            "<b>💡 Astuces Avancées</b>\n\n"
+            "• Combinez plusieurs transformations\n"
+            "• Vérifiez vos stats régulièrement\n"
+            "• Testez avant d'envoyer en masse\n"
+            "• Le bot gère les rate limits automatiquement\n"
+            "• Utilisez /reset pour recommencer\n\n"
+            "<b>Besoin d'aide?</b>\n"
+            "Utilisez /start pour revenir au menu principal!"
+        )
+    }
     
-    db.close()
+    text = tutorials.get(page, tutorials[1])
+    await safe_edit_message(query, text, get_tutorial_navigation(page, 5), parse_mode="HTML")
+
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /stats rapide"""
+    user_id = update.effective_user.id
+    
+    with get_db() as db:
+        prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
+        
+        if not prefs:
+            await update.message.reply_text("❌ Aucune donnée disponible. Utilisez /start pour commencer.")
+            return
+        
+        success_rate = 0
+        if prefs.messages_processed + prefs.messages_failed > 0:
+            success_rate = (prefs.messages_processed / (prefs.messages_processed + prefs.messages_failed)) * 100
+        
+        text = (
+            "📊 <b>Vos Statistiques</b>\n\n"
+            f"📈 Messages traités: <b>{prefs.messages_processed}</b>\n"
+            f"❌ Échecs: <b>{prefs.messages_failed}</b>\n"
+            f"✅ Taux de réussite: <b>{success_rate:.1f}%</b>\n\n"
+            f"📅 Membre depuis: {prefs.created_at.strftime('%d/%m/%Y')}\n"
+            f"🕐 Dernière activité: {prefs.last_activity.strftime('%d/%m/%Y %H:%M')}"
+        )
+        
+        await update.message.reply_text(text, parse_mode="HTML")
+    
+    update_user_activity(user_id)
+
+
+async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Commande /reset rapide"""
+    user_id = update.effective_user.id
+    
+    with get_db() as db:
+        prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
+        if prefs:
+            prefs.prefix = ""
+            prefs.suffix = ""
+            prefs.keyword_find = ""
+            prefs.keyword_replace = ""
+            prefs.publish_mode = False
+            prefs.target_chat_id = None
+            prefs.buffer_mode = False
+            prefs.conversation_state = ""
+    
+    clear_buffer(user_id)
+    
+    await update.message.reply_text(
+        "✅ <b>Réinitialisation réussie!</b>\n\n"
+        "Tous vos paramètres ont été supprimés.\n"
+        "Utilisez /start pour recommencer.",
+        parse_mode="HTML"
+    )
+    
+    update_user_activity(user_id)
+
+
+async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gestion des callbacks des menus"""
+    user_id = update.effective_user.id
+    query = update.callback_query
+    data = query.data
+    
+    with get_db() as db:
+        prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
+        
+        if not prefs:
+            await safe_edit_message(query, "❌ Aucune donnée disponible. Utilisez /start pour commencer.", None, parse_mode="HTML")
+            return
+        
+        if data == "menu_prefix":
+            text = "📝 <b>Gestion du Préfixe</b>\n\n"
+            text += f"<i>Actuel:</i> <code>{prefs.prefix or '(vide)'}</code>\n\n"
+            text += "Le préfixe est ajouté au début de chaque message."
+            await safe_edit_message(query, text, get_prefix_menu(prefs.prefix), parse_mode="HTML")
+        
+        elif data == "menu_suffix":
+            text = "📌 <b>Gestion du Suffixe</b>\n\n"
+            text += f"<i>Actuel:</i> <code>{prefs.suffix or '(vide)'}</code>\n\n"
+            text += "Le suffixe est ajouté à la fin de chaque message."
+            await safe_edit_message(query, text, get_suffix_menu(prefs.suffix), parse_mode="HTML")
+        
+        elif data == "menu_keyword_find":
+            text = "📝 <b>Gestion du Mot-clé</b>\n\n"
+            text += f"<i>Actuel:</i> <code>{prefs.keyword_find or '(vide)'}</code>\n\n"
+            text += "Le mot-clé est recherché et remplacé."
+            await safe_edit_message(query, text, get_keyword_find_menu(prefs.keyword_find), parse_mode="HTML")
+        
+        elif data == "menu_keyword_replace":
+            text = "📝 <b>Gestion du Remplacement</b>\n\n"
+            text += f"<i>Actuel:</i> <code>{prefs.keyword_replace or '(vide)'}</code>\n\n"
+            text += "Le mot-clé sera remplacé par ce texte."
+            await safe_edit_message(query, text, get_keyword_replace_menu(prefs.keyword_replace), parse_mode="HTML")
+        
+        elif data == "menu_publish":
+            text = "📢 <b>Mode Publication</b>\n\n"
+            text += f"<i>Actuel:</i> <code>{prefs.publish_mode}</code>\n\n"
+            text += "Vos messages seront publiés dans le canal."
+            await safe_edit_message(query, text, get_publish_menu(prefs.publish_mode, str(prefs.target_chat_id) if prefs.target_chat_id else ""), parse_mode="HTML")
+        
+        elif data == "menu_bulk":
+            text = "⚡ <b>Traitement Massif</b>\n\n"
+            text += f"<i>Actuel:</i> <code>{prefs.buffer_mode}</code>\n\n"
+            text += "Traitez jusqu'à 100 messages d'un coup!"
+            await safe_edit_message(query, text, get_bulk_menu(prefs.buffer_mode, len(get_buffer_messages(user_id))), parse_mode="HTML")
+            

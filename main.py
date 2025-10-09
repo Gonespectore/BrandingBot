@@ -4,15 +4,17 @@ from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
-    CallbackQueryHandler, filters, ContextTypes
+    CallbackQueryHandler, filters
 )
 from contextlib import asynccontextmanager
 
 from db import get_db, UserPreferences
-from handlers import start, button_callback, handle_text_input
-from message_processor import message_processor, handle_bulk_processing
+from handlers import (
+    start, button_callback, handle_text_input,
+    stats_command, reset_command
+)
 
-# --- Vérification des variables d'environnement ---
+# --- Configuration ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 
@@ -21,244 +23,273 @@ if not TELEGRAM_TOKEN:
 if not WEBHOOK_URL:
     raise RuntimeError("❌ Variable manquante : WEBHOOK_URL")
 
-# --- Logging ---
+# --- Logging optimisé ---
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
 )
 logger = logging.getLogger(__name__)
 
-# --- Variables globales ---
-application = None
-user_message_buffer = {}  # Pour le traitement en lot
+# Réduire le verbosity de certains loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("telegram").setLevel(logging.WARNING)
 
-# --- Lifecycle management ---
+# --- Application Telegram ---
+application = None
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Gestion du cycle de vie de l'application"""
+    """Gestion du cycle de vie - MODE WEBHOOK"""
     global application
     
-    # Startup
-    logger.info("🚀 Démarrage de l'application...")
+    logger.info("🚀 Démarrage du bot en mode WEBHOOK...")
     
-    # Initialiser le bot
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    # Enregistrer les handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", start))
-    application.add_handler(CommandHandler("process", process_bulk_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CallbackQueryHandler(button_callback))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
-    
-    # Initialiser le bot (sans démarrer le polling)
-    await application.initialize()
-    await application.start()
-    
-    # Configurer le webhook
     try:
+        # Créer l'application
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
+        
+        # Enregistrer les handlers
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", start))
+        application.add_handler(CommandHandler("stats", stats_command))
+        application.add_handler(CommandHandler("reset", reset_command))
+        application.add_handler(CallbackQueryHandler(button_callback))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
+        
+        # CRITIQUE: Pour webhook, seulement initialize() - PAS start()
+        await application.initialize()
+        logger.info("✅ Application initialisée")
+        
+        # Configurer le webhook
         webhook_info = await application.bot.get_webhook_info()
+        
         if webhook_info.url != WEBHOOK_URL:
-            await application.bot.set_webhook(url=WEBHOOK_URL)
+            await application.bot.set_webhook(
+                url=WEBHOOK_URL,
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True
+            )
             logger.info(f"✅ Webhook configuré: {WEBHOOK_URL}")
         else:
-            logger.info(f"✅ Webhook déjà configuré: {WEBHOOK_URL}")
+            logger.info(f"✅ Webhook déjà actif: {WEBHOOK_URL}")
+        
+        # Vérifier la connexion
+        bot_info = await application.bot.get_me()
+        logger.info(f"✅ Bot connecté: @{bot_info.username} (ID: {bot_info.id})")
+        
     except Exception as e:
-        logger.error(f"❌ Erreur configuration webhook: {e}")
+        logger.error(f"❌ Erreur initialisation: {e}", exc_info=True)
         raise
     
     yield
     
     # Shutdown
-    logger.info("🛑 Arrêt de l'application...")
-    await application.stop()
+    logger.info("🛑 Arrêt du bot...")
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("✅ Webhook supprimé")
+    except:
+        pass
+    
     await application.shutdown()
+    logger.info("✅ Bot arrêté proprement")
+
 
 # --- FastAPI App ---
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(
+    title="Telegram Advanced Bot",
+    version="2.0.0",
+    lifespan=lifespan
+)
 
 
-# --- Commandes supplémentaires ---
-async def process_bulk_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Commande /process pour traiter plusieurs messages en lot
-    Usage: /process puis envoyer plusieurs messages qui seront bufferisés
-    """
-    user_id = update.effective_user.id
-    
-    if user_id not in user_message_buffer:
-        user_message_buffer[user_id] = []
-    
-    if not context.args:
-        # Initialiser le mode buffer
-        user_message_buffer[user_id] = []
-        await update.message.reply_text(
-            "📥 <b>Mode traitement en lot activé</b>\n\n"
-            "Envoyez vos messages (jusqu'à 100)\n"
-            "Utilisez /process done pour traiter\n"
-            "Utilisez /process cancel pour annuler",
-            parse_mode="HTML"
-        )
-        return
-    
-    command = context.args[0].lower()
-    
-    if command == "done":
-        messages = user_message_buffer.get(user_id, [])
-        if not messages:
-            await update.message.reply_text("❌ Aucun message à traiter")
-            return
-        
-        status_msg = await update.message.reply_text(
-            f"⚙️ <b>Traitement de {len(messages)} messages...</b>",
-            parse_mode="HTML"
-        )
-        
-        result = await handle_bulk_processing(
-            user_id=user_id,
-            messages=messages,
-            context=context,
-            status_message=status_msg
-        )
-        
-        await status_msg.edit_text(
-            f"✅ <b>Traitement terminé!</b>\n\n"
-            f"📊 Total: {result['total']}\n"
-            f"✅ Réussis: {result['successful']}\n"
-            f"❌ Échecs: {result['failed']}",
-            parse_mode="HTML"
-        )
-        
-        user_message_buffer[user_id] = []
-    
-    elif command == "cancel":
-        user_message_buffer[user_id] = []
-        await update.message.reply_text("❌ Traitement en lot annulé")
-    
-    elif command == "status":
-        count = len(user_message_buffer.get(user_id, []))
-        await update.message.reply_text(
-            f"📊 Messages en attente: {count}/100"
-        )
-
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Affiche les statistiques du bot"""
-    user_id = update.effective_user.id
-    
-    db = next(get_db())
-    prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
-    
-    if not prefs:
-        await update.message.reply_text("❌ Aucune donnée disponible")
-        db.close()
-        return
-    
-    stats_text = (
-        "📊 <b>Vos Statistiques</b>\n\n"
-        f"👤 User ID: <code>{user_id}</code>\n"
-        f"📝 Préfixe: {'✅' if prefs.prefix else '❌'}\n"
-        f"📌 Suffixe: {'✅' if prefs.suffix else '❌'}\n"
-        f"🔄 Remplacement: {'✅' if prefs.keyword_find else '❌'}\n"
-        f"📢 Mode publication: {'✅ Activé' if prefs.publish_mode else '❌ Désactivé'}\n"
-        f"📅 Dernière mise à jour: {prefs.updated_at.strftime('%Y-%m-%d %H:%M')}\n\n"
-        f"⚡ Capacité: Jusqu'à 100+ messages simultanés"
-    )
-    
-    await update.message.reply_text(stats_text, parse_mode="HTML")
-    db.close()
-
-
-# --- Endpoint Webhook ---
+# --- Webhook Endpoint ---
 @app.post("/webhook")
 async def telegram_webhook(request: Request):
-    """Reçoit les updates de Telegram"""
+    """
+    Endpoint principal pour recevoir les updates Telegram
+    CRITIQUE: Utiliser process_update() et non update_queue en mode webhook!
+    """
     try:
-        json_data = await request.json()
-        update = Update.de_json(json_data, application.bot)
+        # Récupérer les données
+        data = await request.json()
         
-        # Gestion du buffer pour le traitement en lot
-        if update.message and update.message.text:
-            user_id = update.effective_user.id
-            if user_id in user_message_buffer and not update.message.text.startswith('/'):
-                # Ajouter au buffer
-                user_message_buffer[user_id].append(update.message.text)
-                
-                # Limiter à 100 messages
-                if len(user_message_buffer[user_id]) >= 100:
-                    await update.message.reply_text(
-                        "⚠️ <b>Limite atteinte (100 messages)</b>\n\n"
-                        "Utilisez /process done pour traiter",
-                        parse_mode="HTML"
-                    )
-                else:
-                    # Confirmer silencieusement l'ajout
-                    await update.message.reply_text(
-                        f"✅ Message {len(user_message_buffer[user_id])}/100 ajouté"
-                    )
-                return {"status": "buffered"}
+        # Logger pour debug (optionnel)
+        if data.get("message"):
+            user_id = data["message"].get("from", {}).get("id")
+            text = data["message"].get("text", "")
+            logger.info(f"📨 Message reçu de {user_id}: {text[:50]}")
+        elif data.get("callback_query"):
+            user_id = data["callback_query"].get("from", {}).get("id")
+            callback_data = data["callback_query"].get("data", "")
+            logger.info(f"🔘 Callback de {user_id}: {callback_data}")
         
-        # Traiter normalement
-        await application.update_queue.put(update)
-        return {"status": "ok"}
+        # Convertir en Update Telegram
+        update = Update.de_json(data, application.bot)
+        
+        # CRITIQUE: En webhook, utiliser process_update() directement
+        await application.process_update(update)
+        
+        return {"ok": True}
     
     except Exception as e:
         logger.error(f"❌ Erreur webhook: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail="Invalid update")
+        # Ne pas raise pour éviter que Telegram considère le webhook comme cassé
+        return {"ok": False, "error": str(e)}
 
 
 # --- Health Check ---
 @app.get("/")
 async def health_check():
     """Endpoint de santé"""
-    return {
-        "status": "✅ Online",
-        "bot": "Telegram Advanced Bot",
-        "webhook": WEBHOOK_URL,
-        "features": [
-            "Prefix/Suffix",
-            "Keyword Replacement",
-            "Publish Mode",
-            "Bulk Processing (100+ messages)",
-            "Interactive Menu"
-        ],
-        "version": "2.0.0"
-    }
+    try:
+        bot_info = await application.bot.get_me()
+        webhook_info = await application.bot.get_webhook_info()
+        
+        return {
+            "status": "✅ Online",
+            "bot": {
+                "username": f"@{bot_info.username}",
+                "id": bot_info.id,
+                "name": bot_info.first_name
+            },
+            "webhook": {
+                "url": webhook_info.url,
+                "pending_updates": webhook_info.pending_update_count
+            },
+            "features": [
+                "Prefix/Suffix automatique",
+                "Keyword Replacement intelligent",
+                "Publish Mode vers canal",
+                "Bulk Processing (100+ messages)",
+                "Interactive Menu avec images",
+                "Statistiques détaillées",
+                "Tutoriel intégré",
+                "Retry exponentiel"
+            ],
+            "version": "2.0.0"
+        }
+    except Exception as e:
+        logger.error(f"Erreur health check: {e}")
+        return {
+            "status": "⚠️ Partial",
+            "error": str(e)
+        }
 
 
 @app.get("/stats")
 async def global_stats():
-    """Statistiques globales"""
-    db = next(get_db())
-    total_users = db.query(UserPreferences).count()
-    active_publish = db.query(UserPreferences).filter(
-        UserPreferences.publish_mode == True
-    ).count()
-    db.close()
-    
-    return {
-        "total_users": total_users,
-        "active_publish_mode": active_publish,
-        "processor_stats": {
-            "max_concurrent": message_processor.max_concurrent,
-            "processed_total": message_processor.processed_count,
-            "failed_total": message_processor.failed_count
+    """Statistiques globales du bot"""
+    try:
+        with get_db() as db:
+            total_users = db.query(UserPreferences).count()
+            active_publish = db.query(UserPreferences).filter(
+                UserPreferences.publish_mode == True
+            ).count()
+            active_buffer = db.query(UserPreferences).filter(
+                UserPreferences.buffer_mode == True
+            ).count()
+            
+            total_processed = db.query(UserPreferences).with_entities(
+                func.sum(UserPreferences.messages_processed)
+            ).scalar() or 0
+            
+            total_failed = db.query(UserPreferences).with_entities(
+                func.sum(UserPreferences.messages_failed)
+            ).scalar() or 0
+        
+        success_rate = 0
+        if total_processed + total_failed > 0:
+            success_rate = (total_processed / (total_processed + total_failed)) * 100
+        
+        return {
+            "users": {
+                "total": total_users,
+                "with_publish_mode": active_publish,
+                "with_buffer_mode": active_buffer
+            },
+            "messages": {
+                "total_processed": total_processed,
+                "total_failed": total_failed,
+                "success_rate": f"{success_rate:.2f}%"
+            },
+            "processor": {
+                "max_concurrent": 15,
+                "base_delay": 0.05,
+                "retry_count": 3
+            }
         }
-    }
+    except Exception as e:
+        logger.error(f"Erreur stats: {e}")
+        return {"error": str(e)}
 
 
-# --- Gestion des erreurs ---
+@app.get("/webhook/info")
+async def webhook_info():
+    """Informations sur le webhook"""
+    try:
+        info = await application.bot.get_webhook_info()
+        return {
+            "url": info.url,
+            "has_custom_certificate": info.has_custom_certificate,
+            "pending_update_count": info.pending_update_count,
+            "last_error_date": info.last_error_date,
+            "last_error_message": info.last_error_message,
+            "max_connections": info.max_connections,
+            "allowed_updates": info.allowed_updates
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.post("/webhook/reset")
+async def reset_webhook():
+    """Force la reconfiguration du webhook (debug)"""
+    try:
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        await application.bot.set_webhook(
+            url=WEBHOOK_URL,
+            allowed_updates=["message", "callback_query"],
+            drop_pending_updates=True
+        )
+        return {"status": "✅ Webhook reconfiguré", "url": WEBHOOK_URL}
+    except Exception as e:
+        logger.error(f"Erreur reset webhook: {e}")
+        return {"status": "❌ Erreur", "error": str(e)}
+
+
+# --- Gestion d'erreurs ---
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
+    """Handler global pour les erreurs non gérées"""
     logger.error(f"❌ Erreur non gérée: {exc}", exc_info=True)
     return {
         "status": "error",
-        "message": str(exc)
+        "message": str(exc),
+        "path": str(request.url)
     }
 
 
+# --- Import pour les stats ---
+from sqlalchemy import func
+
+
+# --- Point d'entrée ---
 if __name__ == "__main__":
     import uvicorn
+    
     port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    
+    logger.info(f"🚀 Démarrage sur le port {port}")
+    
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        access_log=True
+    )
