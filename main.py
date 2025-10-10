@@ -66,11 +66,12 @@ async def lifespan(app: FastAPI):
         
         # Enregistrer les handlers
         # Capture TOUS les messages (texte, médias, etc.) sauf les commandes
+        document_filter = filters.Document()
         all_media_filters = (
             filters.TEXT |
             filters.PHOTO |
             filters.VIDEO |
-            filters.Document |  # ← Le seul avec un majuscule initial !
+            document_filter |  # ← Instancier pour que ça marche de façon simple!
             filters.AUDIO |
             filters.VOICE |
             filters.CONTACT |
