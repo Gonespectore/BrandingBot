@@ -13,6 +13,16 @@ from handlers import (
     start, button_callback, handle_all_messages,
     stats_command, reset_command
 )
+# --- Logging optimisé ---
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 import telegram
 logger.info(f"Version: {telegram.__version__}")
 
