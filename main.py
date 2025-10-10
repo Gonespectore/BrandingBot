@@ -58,7 +58,7 @@ async def lifespan(app: FastAPI):
             filters.TEXT |
             filters.PHOTO |
             filters.VIDEO |
-            filters.DOCUMENT |
+            filters.Document |
             filters.AUDIO |
             filters.VOICE |
             filters.CONTACT |
