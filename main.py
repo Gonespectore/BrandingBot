@@ -13,6 +13,8 @@ from handlers import (
     start, button_callback, handle_all_messages,
     stats_command, reset_command
 )
+import telegram
+logger.info(f"Version: {telegram.__version__}")
 
 # --- Configuration ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -58,12 +60,12 @@ async def lifespan(app: FastAPI):
             filters.TEXT |
             filters.PHOTO |
             filters.VIDEO |
-            filters.Document() |
+            filters.DOCUMENT |  # ← TOUT EN MAJUSCULES
             filters.AUDIO |
             filters.VOICE |
             filters.CONTACT |
             filters.LOCATION |
-            filters.Sticker() |
+            filters.STICKER |
             filters.ANIMATION
         )
         
