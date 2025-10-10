@@ -436,6 +436,266 @@ async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     update_user_activity(user_id)
 
+async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Gère TOUS les types de messages Telegram (texte, médias, etc.)"""
+    user_id = update.effective_user.id
+    message = update.message
+    
+    # Extraire le texte principal (texte ou légende)
+    original_text = ""
+    has_media = False
+    media_type = None
+    media_file_id = None
+    
+    # 1. Gérer le texte pur
+    if message.text:
+        original_text = message.text
+        media_type = "text"
+    
+    # 2. Gérer les médias avec légende
+    elif message.caption:
+        original_text = message.caption
+        has_media = True
+        if message.photo:
+            media_type = "photo"
+            media_file_id = message.photo[-1].file_id  # Meilleure qualité
+        elif message.video:
+            media_type = "video"
+            media_file_id = message.video.file_id
+        elif message.document:
+            media_type = "document"
+            media_file_id = message.document.file_id
+        elif message.audio:
+            media_type = "audio"
+            media_file_id = message.audio.file_id
+        elif message.voice:
+            media_type = "voice"
+            media_file_id = message.voice.file_id
+        elif message.animation:
+            media_type = "animation"
+            media_file_id = message.animation.file_id
+        elif message.sticker:
+            media_type = "sticker"
+            media_file_id = message.sticker.file_id
+    
+    # 3. Médias sans légende
+    else:
+        has_media = True
+        if message.photo:
+            original_text = "[Photo sans légende]"
+            media_type = "photo"
+            media_file_id = message.photo[-1].file_id
+        elif message.video:
+            original_text = "[Vidéo sans légende]"
+            media_type = "video"
+            media_file_id = message.video.file_id
+        elif message.document:
+            original_text = f"[Document: {message.document.file_name or 'sans nom'}]"
+            media_type = "document"
+            media_file_id = message.document.file_id
+        elif message.audio:
+            original_text = f"[Audio: {message.audio.title or 'sans titre'}]"
+            media_type = "audio"
+            media_file_id = message.audio.file_id
+        elif message.voice:
+            original_text = "[Message vocal]"
+            media_type = "voice"
+            media_file_id = message.voice.file_id
+        elif message.contact:
+            original_text = f"[Contact: {message.contact.first_name or 'Inconnu'}]"
+            media_type = "contact"
+        elif message.location:
+            original_text = "[Position géographique]"
+            media_type = "location"
+        elif message.sticker:
+            original_text = "[Sticker]"
+            media_type = "sticker"
+            media_file_id = message.sticker.file_id
+        elif message.animation:
+            original_text = "[Animation]"
+            media_type = "animation"
+            media_file_id = message.animation.file_id
+        else:
+            original_text = "[Message non pris en charge]"
+            media_type = "unknown"
+    
+    # Vérifier si on attend une entrée spécifique (ex: définition de préfixe)
+    with get_db() as db:
+        prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
+        if not prefs:
+            prefs = UserPreferences(user_id=user_id)
+            db.add(prefs)
+            db.flush()
+        
+        state = prefs.conversation_state
+        
+        # Si on est en train de définir un paramètre, seul le texte pur est accepté
+        if state in [WAITING_PREFIX, WAITING_SUFFIX, WAITING_KEYWORD_FIND, 
+                    WAITING_KEYWORD_REPLACE, WAITING_TARGET_CHAT]:
+            if media_type != "text":
+                await update.message.reply_text(
+                    "❌ <b>Texte requis</b>\n\n"
+                    "Veuillez envoyer uniquement du texte pour cette étape.",
+                    parse_mode="HTML"
+                )
+                return
+            else:
+                # Réutiliser la logique existante pour le texte
+                await handle_text_input(update, context)
+                return
+    
+    # Mode buffer activé → seulement texte et légendes
+    if hasattr(prefs, 'buffer_mode') and prefs.buffer_mode:
+        if media_type in ["text", "photo", "video", "document", "audio", "voice", "animation"]:
+            add_to_buffer(user_id, original_text)
+            buffer_count = len(get_buffer_messages(user_id))
+            
+            if buffer_count >= 100:
+                await update.message.reply_text(
+                    f"⚠️ <b>Limite atteinte!</b>\n\n"
+                    f"Vous avez 100 messages en attente.\n"
+                    f"Retournez au menu pour les traiter.",
+                    parse_mode="HTML"
+                )
+            else:
+                await update.message.reply_text(
+                    f"✅ Message {buffer_count}/100 ajouté au buffer"
+                )
+            update_user_activity(user_id)
+            return
+        else:
+            await update.message.reply_text(
+                "❌ <b>Type non supporté en mode buffer</b>\n\n"
+                "Seuls les messages avec du texte ou des légendes sont acceptés.",
+                parse_mode="HTML"
+            )
+            return
+    
+    # Traitement normal pour tous les types
+    await process_all_message_types(update, context, prefs, original_text, media_type, media_file_id, has_media)
+
+
+async def process_all_message_types(
+    update: Update, 
+    context: ContextTypes.DEFAULT_TYPE, 
+    prefs: UserPreferences,
+    original_text: str,
+    media_type: str,
+    media_file_id: str = None,
+    has_media: bool = False
+):
+    """Traite tous les types de messages avec transformations"""
+    # Appliquer les transformations au texte
+    processed_text = original_text
+    
+    if prefs.keyword_find and prefs.keyword_replace:
+        processed_text = processed_text.replace(prefs.keyword_find, prefs.keyword_replace)
+    
+    processed_text = f"{prefs.prefix}{processed_text}{prefs.suffix}"
+    
+    # Limiter la longueur pour Telegram
+    if len(processed_text) > 4096:
+        processed_text = processed_text[:4093] + "..."
+    
+    # Mode publication
+    if prefs.publish_mode and prefs.target_chat_id:
+        try:
+            if media_type == "text":
+                await context.bot.send_message(
+                    chat_id=prefs.target_chat_id,
+                    text=processed_text
+                )
+            elif media_type == "photo" and media_file_id:
+                await context.bot.send_photo(
+                    chat_id=prefs.target_chat_id,
+                    photo=media_file_id,
+                    caption=processed_text
+                )
+            elif media_type == "video" and media_file_id:
+                await context.bot.send_video(
+                    chat_id=prefs.target_chat_id,
+                    video=media_file_id,
+                    caption=processed_text
+                )
+            elif media_type == "document" and media_file_id:
+                await context.bot.send_document(
+                    chat_id=prefs.target_chat_id,
+                    document=media_file_id,
+                    caption=processed_text
+                )
+            elif media_type == "audio" and media_file_id:
+                await context.bot.send_audio(
+                    chat_id=prefs.target_chat_id,
+                    audio=media_file_id,
+                    caption=processed_text
+                )
+            elif media_type == "voice" and media_file_id:
+                await context.bot.send_voice(
+                    chat_id=prefs.target_chat_id,
+                    voice=media_file_id,
+                    caption=processed_text
+                )
+            elif media_type == "animation" and media_file_id:
+                await context.bot.send_animation(
+                    chat_id=prefs.target_chat_id,
+                    animation=media_file_id,
+                    caption=processed_text
+                )
+            elif media_type == "sticker" and media_file_id:
+                # Les stickers ne supportent pas de légende → envoyer séparément
+                await context.bot.send_sticker(
+                    chat_id=prefs.target_chat_id,
+                    sticker=media_file_id
+                )
+                if processed_text != "[Sticker]":
+                    await context.bot.send_message(
+                        chat_id=prefs.target_chat_id,
+                        text=processed_text
+                    )
+            else:
+                # Types sans média ou non supportés → envoyer juste le texte
+                await context.bot.send_message(
+                    chat_id=prefs.target_chat_id,
+                    text=processed_text
+                )
+            
+            await update.message.reply_text("✅ Message publié dans le canal!")
+            
+            with get_db() as db:
+                user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
+                if user_prefs:
+                    user_prefs.messages_processed += 1
+        
+        except TelegramError as e:
+            logger.error(f"Erreur publication: {e}")
+            await update.message.reply_text(
+                f"❌ <b>Erreur lors de la publication:</b>\n{str(e)}\n\n"
+                "Vérifiez que le bot est administrateur du canal.",
+                parse_mode="HTML"
+            )
+            
+            with get_db() as db:
+                user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
+                if user_prefs:
+                    user_prefs.messages_failed += 1
+    else:
+        # Répondre dans le chat privé
+        if has_media and media_type in ["sticker"]:
+            # Pour les stickers, on ne peut pas modifier → envoyer le sticker + texte
+            if media_file_id:
+                await update.message.reply_sticker(sticker=media_file_id)
+            if processed_text != "[Sticker]":
+                await update.message.reply_text(processed_text)
+        else:
+            # Pour tous les autres types, répondre avec le texte transformé
+            await update.message.reply_text(processed_text)
+        
+        with get_db() as db:
+            user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
+            if user_prefs:
+                user_prefs.messages_processed += 1
+    
+    update_user_activity(prefs.user_id)
 
 async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_TYPE, prefs: UserPreferences):
     """Traite un message normalement (hors buffer)"""
