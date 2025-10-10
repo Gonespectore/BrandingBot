@@ -344,121 +344,52 @@ async def button_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         elif data == "show_tutorial":
             await show_tutorial(query, 1)
+        
+        elif data == "menu_prefix":
+            text = "📝 <b>Gestion du Préfixe</b>\n\n"
+            text += f"<i>Actuel:</i> <code>{prefs.prefix or '(vide)'}</code>\n\n"
+            text += "Le préfixe est ajouté au début de chaque message."
+            await safe_edit_message(query, text, get_prefix_menu(prefs.prefix), parse_mode="HTML")
+        
+        elif data == "menu_suffix":
+            text = "📌 <b>Gestion du Suffixe</b>\n\n"
+            text += f"<i>Actuel:</i> <code>{prefs.suffix or '(vide)'}</code>\n\n"
+            text += "Le suffixe est ajouté à la fin de chaque message."
+            await safe_edit_message(query, text, get_suffix_menu(prefs.suffix), parse_mode="HTML")
     
     update_user_activity(user_id)
 
-
-async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gestion intelligente des entrées textuelles"""
-    user_id = update.effective_user.id
-    text = update.message.text
-    
-    with get_db() as db:
-        prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
-        if not prefs:
-            prefs = UserPreferences(user_id=user_id)
-            db.add(prefs)
-            db.flush()
-        
-        # Vérifier si on attend une entrée spécifique
-        state = prefs.conversation_state
-        
-        if state == WAITING_PREFIX:
-            prefs.prefix = text
-            prefs.conversation_state = ""
-            await update.message.reply_text(
-                f"✅ <b>Préfixe défini:</b>\n<code>{text}</code>\n\nTous vos messages commenceront par ce texte.",
-                parse_mode="HTML"
-            )
-        
-        elif state == WAITING_SUFFIX:
-            prefs.suffix = text
-            prefs.conversation_state = ""
-            await update.message.reply_text(
-                f"✅ <b>Suffixe défini:</b>\n<code>{text}</code>\n\nTous vos messages se termineront par ce texte.",
-                parse_mode="HTML"
-            )
-        
-        elif state == WAITING_KEYWORD_FIND:
-            prefs.keyword_find = text
-            prefs.conversation_state = ""
-            await update.message.reply_text(
-                f"✅ <b>Mot-clé défini:</b>\n<code>{text}</code>\n\nToutes les occurrences seront remplacées.",
-                parse_mode="HTML"
-            )
-        
-        elif state == WAITING_KEYWORD_REPLACE:
-            prefs.keyword_replace = text
-            prefs.conversation_state = ""
-            await update.message.reply_text(
-                f"✅ <b>Remplacement défini:</b>\n<code>{text}</code>\n\nLe mot-clé sera remplacé par ce texte.",
-                parse_mode="HTML"
-            )
-        
-        elif state == WAITING_TARGET_CHAT:
-            chat_id = validate_chat_id(text)
-            if chat_id:
-                prefs.target_chat_id = chat_id
-                prefs.conversation_state = ""
-                await update.message.reply_text(
-                    f"✅ <b>Canal cible défini:</b>\n<code>{chat_id}</code>\n\n"
-                    f"💡 Testez avec le bouton 'Tester l'envoi' dans le menu.",
-                    parse_mode="HTML"
-                )
-            else:
-                await update.message.reply_text(
-                    "❌ <b>ID invalide</b>\n\n"
-                    "L'ID doit être un nombre (généralement négatif pour les groupes).\n"
-                    "Exemple: <code>-1001234567890</code>",
-                    parse_mode="HTML"
-                )
-        
-        # Mode buffer activé
-        elif prefs.buffer_mode:
-            add_to_buffer(user_id, text)
-            buffer_count = len(get_buffer_messages(user_id))
-            
-            if buffer_count >= 100:
-                await update.message.reply_text(
-                    f"⚠️ <b>Limite atteinte!</b>\n\n"
-                    f"Vous avez 100 messages en attente.\n"
-                    f"Retournez au menu pour les traiter.",
-                    parse_mode="HTML"
-                )
-            else:
-                await update.message.reply_text(
-                    f"✅ Message {buffer_count}/100 ajouté au buffer"
-                )
-        
-        # Traitement normal
-        else:
-            await process_normal_message(update, context, prefs)
-    
-    update_user_activity(user_id)
 
 async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gère TOUS les types de messages Telegram (texte, médias, etc.)"""
+    """
+    HANDLER UNIVERSEL : Gère TOUS les types de messages Telegram
+    - Texte pur
+    - Photos, vidéos, documents, audio, voice, animations, stickers
+    - Avec ou sans légende/caption
+    - Détection automatique du contexte (conversation state, buffer mode, etc.)
+    """
     user_id = update.effective_user.id
     message = update.message
     
-    # Extraire le texte principal (texte ou légende)
+    # === ÉTAPE 1: EXTRACTION DES DONNÉES ===
     original_text = ""
     has_media = False
     media_type = None
     media_file_id = None
     
-    # 1. Gérer le texte pur
+    # 1.A - Texte pur
     if message.text:
         original_text = message.text
         media_type = "text"
     
-    # 2. Gérer les médias avec légende
+    # 1.B - Médias avec légende
     elif message.caption:
         original_text = message.caption
         has_media = True
+        
         if message.photo:
             media_type = "photo"
-            media_file_id = message.photo[-1].file_id  # Meilleure qualité
+            media_file_id = message.photo[-1].file_id
         elif message.video:
             media_type = "video"
             media_file_id = message.video.file_id
@@ -478,9 +409,10 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             media_type = "sticker"
             media_file_id = message.sticker.file_id
     
-    # 3. Médias sans légende
+    # 1.C - Médias SANS légende (générer des descriptions)
     else:
         has_media = True
+        
         if message.photo:
             original_text = "[Photo sans légende]"
             media_type = "photo"
@@ -519,7 +451,7 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             original_text = "[Message non pris en charge]"
             media_type = "unknown"
     
-    # Vérifier si on attend une entrée spécifique (ex: définition de préfixe)
+    # === ÉTAPE 2: RÉCUPÉRATION DES PRÉFÉRENCES ===
     with get_db() as db:
         prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
         if not prefs:
@@ -527,11 +459,14 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
             db.add(prefs)
             db.flush()
         
-        state = prefs.conversation_state
+        conversation_state = prefs.conversation_state or ""
         
-        # Si on est en train de définir un paramètre, seul le texte pur est accepté
-        if state in [WAITING_PREFIX, WAITING_SUFFIX, WAITING_KEYWORD_FIND, 
-                    WAITING_KEYWORD_REPLACE, WAITING_TARGET_CHAT]:
+        # === ÉTAPE 3: GESTION DES ÉTATS DE CONVERSATION ===
+        # Si on attend une entrée spécifique (définition de paramètre)
+        if conversation_state in [WAITING_PREFIX, WAITING_SUFFIX, WAITING_KEYWORD_FIND, 
+                                  WAITING_KEYWORD_REPLACE, WAITING_TARGET_CHAT]:
+            
+            # Seul le texte pur est accepté pour les paramètres
             if media_type != "text":
                 await update.message.reply_text(
                     "❌ <b>Texte requis</b>\n\n"
@@ -539,222 +474,244 @@ async def handle_all_messages(update: Update, context: ContextTypes.DEFAULT_TYPE
                     parse_mode="HTML"
                 )
                 return
-            else:
-                # Réutiliser la logique existante pour le texte
-                await handle_text_input(update, context)
-                return
-    
-    # Mode buffer activé → seulement texte et légendes
-    if hasattr(prefs, 'buffer_mode') and prefs.buffer_mode:
-        if media_type in ["text", "photo", "video", "document", "audio", "voice", "animation"]:
-            add_to_buffer(user_id, original_text)
-            buffer_count = len(get_buffer_messages(user_id))
             
-            if buffer_count >= 100:
+            # Traiter selon l'état
+            if conversation_state == WAITING_PREFIX:
+                prefs.prefix = original_text
+                prefs.conversation_state = ""
                 await update.message.reply_text(
-                    f"⚠️ <b>Limite atteinte!</b>\n\n"
-                    f"Vous avez 100 messages en attente.\n"
-                    f"Retournez au menu pour les traiter.",
+                    f"✅ <b>Préfixe défini:</b>\n<code>{original_text}</code>\n\n"
+                    "Tous vos messages commenceront par ce texte.",
                     parse_mode="HTML"
                 )
-            else:
+            
+            elif conversation_state == WAITING_SUFFIX:
+                prefs.suffix = original_text
+                prefs.conversation_state = ""
                 await update.message.reply_text(
-                    f"✅ Message {buffer_count}/100 ajouté au buffer"
+                    f"✅ <b>Suffixe défini:</b>\n<code>{original_text}</code>\n\n"
+                    "Tous vos messages se termineront par ce texte.",
+                    parse_mode="HTML"
                 )
+            
+            elif conversation_state == WAITING_KEYWORD_FIND:
+                prefs.keyword_find = original_text
+                prefs.conversation_state = ""
+                await update.message.reply_text(
+                    f"✅ <b>Mot-clé défini:</b>\n<code>{original_text}</code>\n\n"
+                    "Toutes les occurrences seront remplacées.",
+                    parse_mode="HTML"
+                )
+            
+            elif conversation_state == WAITING_KEYWORD_REPLACE:
+                prefs.keyword_replace = original_text
+                prefs.conversation_state = ""
+                await update.message.reply_text(
+                    f"✅ <b>Remplacement défini:</b>\n<code>{original_text}</code>\n\n"
+                    "Le mot-clé sera remplacé par ce texte.",
+                    parse_mode="HTML"
+                )
+            
+            elif conversation_state == WAITING_TARGET_CHAT:
+                chat_id = validate_chat_id(original_text)
+                if chat_id:
+                    prefs.target_chat_id = chat_id
+                    prefs.conversation_state = ""
+                    await update.message.reply_text(
+                        f"✅ <b>Canal cible défini:</b>\n<code>{chat_id}</code>\n\n"
+                        "💡 Testez avec le bouton 'Tester l'envoi' dans le menu.",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await update.message.reply_text(
+                        "❌ <b>ID invalide</b>\n\n"
+                        "L'ID doit être un nombre (généralement négatif pour les groupes).\n"
+                        "Exemple: <code>-1001234567890</code>",
+                        parse_mode="HTML"
+                    )
+            
             update_user_activity(user_id)
             return
-        else:
-            await update.message.reply_text(
-                "❌ <b>Type non supporté en mode buffer</b>\n\n"
-                "Seuls les messages avec du texte ou des légendes sont acceptés.",
-                parse_mode="HTML"
-            )
+        
+        # === ÉTAPE 4: MODE BUFFER ===
+        if prefs.buffer_mode:
+            # Seuls les messages avec texte/caption sont acceptés en buffer
+            if media_type in ["text", "photo", "video", "document", "audio", "voice", "animation"]:
+                add_to_buffer(user_id, original_text)
+                buffer_count = len(get_buffer_messages(user_id))
+                
+                if buffer_count >= 100:
+                    await update.message.reply_text(
+                        "⚠️ <b>Limite atteinte!</b>\n\n"
+                        f"Vous avez 100 messages en attente.\n"
+                        "Retournez au menu pour les traiter.",
+                        parse_mode="HTML"
+                    )
+                else:
+                    await update.message.reply_text(
+                        f"✅ Message {buffer_count}/100 ajouté au buffer"
+                    )
+            else:
+                await update.message.reply_text(
+                    "❌ <b>Type non supporté en mode buffer</b>\n\n"
+                    "Seuls les messages avec du texte ou des légendes sont acceptés.",
+                    parse_mode="HTML"
+                )
+            
+            update_user_activity(user_id)
             return
-    
-    # Traitement normal pour tous les types
-    await process_all_message_types(update, context, prefs, original_text, media_type, media_file_id, has_media)
+        
+        # === ÉTAPE 5: TRAITEMENT NORMAL ===
+        await process_message_with_transformations(
+            update=update,
+            context=context,
+            prefs=prefs,
+            original_text=original_text,
+            media_type=media_type,
+            media_file_id=media_file_id,
+            has_media=has_media
+        )
 
 
-async def process_all_message_types(
-    update: Update, 
-    context: ContextTypes.DEFAULT_TYPE, 
+async def process_message_with_transformations(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
     prefs: UserPreferences,
     original_text: str,
     media_type: str,
     media_file_id: str = None,
     has_media: bool = False
 ):
-    """Traite tous les types de messages avec transformations"""
-    # Appliquer les transformations au texte
+    """
+    Applique toutes les transformations et publie/répond selon la config
+    """
+    # === TRANSFORMATIONS DU TEXTE ===
     processed_text = original_text
     
+    # 1. Remplacement de mots-clés
     if prefs.keyword_find and prefs.keyword_replace:
         processed_text = processed_text.replace(prefs.keyword_find, prefs.keyword_replace)
     
-    processed_text = f"{prefs.prefix}{processed_text}{prefs.suffix}"
+    # 2. Ajout préfixe/suffixe
+    processed_text = f"{prefs.prefix or ''}{processed_text}{prefs.suffix or ''}"
     
-    # Limiter la longueur pour Telegram
+    # 3. Limite Telegram (4096 caractères)
     if len(processed_text) > 4096:
         processed_text = processed_text[:4093] + "..."
     
-    # Mode publication
-    if prefs.publish_mode and prefs.target_chat_id:
-        try:
-            if media_type == "text":
-                await context.bot.send_message(
-                    chat_id=prefs.target_chat_id,
-                    text=processed_text
-                )
-            elif media_type == "photo" and media_file_id:
-                await context.bot.send_photo(
-                    chat_id=prefs.target_chat_id,
-                    photo=media_file_id,
-                    caption=processed_text
-                )
-            elif media_type == "video" and media_file_id:
-                await context.bot.send_video(
-                    chat_id=prefs.target_chat_id,
-                    video=media_file_id,
-                    caption=processed_text
-                )
-            elif media_type == "document" and media_file_id:
-                await context.bot.send_document(
-                    chat_id=prefs.target_chat_id,
-                    document=media_file_id,
-                    caption=processed_text
-                )
-            elif media_type == "audio" and media_file_id:
-                await context.bot.send_audio(
-                    chat_id=prefs.target_chat_id,
-                    audio=media_file_id,
-                    caption=processed_text
-                )
-            elif media_type == "voice" and media_file_id:
-                await context.bot.send_voice(
-                    chat_id=prefs.target_chat_id,
-                    voice=media_file_id,
-                    caption=processed_text
-                )
-            elif media_type == "animation" and media_file_id:
-                await context.bot.send_animation(
-                    chat_id=prefs.target_chat_id,
-                    animation=media_file_id,
-                    caption=processed_text
-                )
-            elif media_type == "sticker" and media_file_id:
-                # Les stickers ne supportent pas de légende → envoyer séparément
-                await context.bot.send_sticker(
-                    chat_id=prefs.target_chat_id,
-                    sticker=media_file_id
-                )
-                if processed_text != "[Sticker]":
-                    await context.bot.send_message(
-                        chat_id=prefs.target_chat_id,
-                        text=processed_text
-                    )
-            else:
-                # Types sans média ou non supportés → envoyer juste le texte
-                await context.bot.send_message(
-                    chat_id=prefs.target_chat_id,
-                    text=processed_text
-                )
+    # === PUBLICATION / RÉPONSE ===
+    try:
+        # MODE PUBLICATION vers un canal
+        if prefs.publish_mode and prefs.target_chat_id:
+            await send_message_to_target(
+                bot=context.bot,
+                chat_id=prefs.target_chat_id,
+                text=processed_text,
+                media_type=media_type,
+                media_file_id=media_file_id
+            )
             
             await update.message.reply_text("✅ Message publié dans le canal!")
             
+            # Incrémenter compteur succès
             with get_db() as db:
-                user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
+                user_prefs = db.query(UserPreferences).filter(
+                    UserPreferences.user_id == prefs.user_id
+                ).first()
                 if user_prefs:
                     user_prefs.messages_processed += 1
         
-        except TelegramError as e:
-            logger.error(f"Erreur publication: {e}")
-            await update.message.reply_text(
-                f"❌ <b>Erreur lors de la publication:</b>\n{str(e)}\n\n"
-                "Vérifiez que le bot est administrateur du canal.",
-                parse_mode="HTML"
+        # MODE NORMAL (réponse dans le chat privé)
+        else:
+            await send_message_to_target(
+                bot=context.bot,
+                chat_id=update.effective_chat.id,
+                text=processed_text,
+                media_type=media_type,
+                media_file_id=media_file_id,
+                reply_to=update.message.message_id
             )
             
+            # Incrémenter compteur succès
             with get_db() as db:
-                user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
+                user_prefs = db.query(UserPreferences).filter(
+                    UserPreferences.user_id == prefs.user_id
+                ).first()
                 if user_prefs:
-                    user_prefs.messages_failed += 1
-    else:
-        # Répondre dans le chat privé
-        if has_media and media_type in ["sticker"]:
-            # Pour les stickers, on ne peut pas modifier → envoyer le sticker + texte
-            if media_file_id:
-                await update.message.reply_sticker(sticker=media_file_id)
-            if processed_text != "[Sticker]":
-                await update.message.reply_text(processed_text)
-        else:
-            # Pour tous les autres types, répondre avec le texte transformé
-            await update.message.reply_text(processed_text)
+                    user_prefs.messages_processed += 1
+    
+    except TelegramError as e:
+        logger.error(f"Erreur envoi message: {e}")
         
+        await update.message.reply_text(
+            f"❌ <b>Erreur:</b>\n{str(e)}\n\n"
+            "Vérifiez que le bot a les permissions nécessaires.",
+            parse_mode="HTML"
+        )
+        
+        # Incrémenter compteur échecs
         with get_db() as db:
-            user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
+            user_prefs = db.query(UserPreferences).filter(
+                UserPreferences.user_id == prefs.user_id
+            ).first()
             if user_prefs:
-                user_prefs.messages_processed += 1
+                user_prefs.messages_failed += 1
     
     update_user_activity(prefs.user_id)
 
-async def process_normal_message(update: Update, context: ContextTypes.DEFAULT_TYPE, prefs: UserPreferences):
-    """Traite un message normalement (hors buffer)"""
-    text = update.message.text
+
+async def send_message_to_target(
+    bot,
+    chat_id: int,
+    text: str,
+    media_type: str,
+    media_file_id: str = None,
+    reply_to: int = None
+):
+    """
+    Envoie un message (texte ou média) vers le chat cible
+    Gère tous les types de médias supportés par Telegram
+    """
+    send_kwargs = {"chat_id": chat_id}
+    if reply_to:
+        send_kwargs["reply_to_message_id"] = reply_to
     
-    # Appliquer les transformations
-    processed_text = text
+    if media_type == "text":
+        await bot.send_message(text=text, **send_kwargs)
     
-    # Remplacement de mots-clés
-    if prefs.keyword_find and prefs.keyword_replace:
-        processed_text = processed_text.replace(prefs.keyword_find, prefs.keyword_replace)
+    elif media_type == "photo" and media_file_id:
+        await bot.send_photo(photo=media_file_id, caption=text, **send_kwargs)
     
-    # Ajout préfixe/suffixe
-    processed_text = f"{prefs.prefix}{processed_text}{prefs.suffix}"
+    elif media_type == "video" and media_file_id:
+        await bot.send_video(video=media_file_id, caption=text, **send_kwargs)
     
-    # Limiter la longueur
-    if len(processed_text) > 4096:
-        processed_text = processed_text[:4093] + "..."
+    elif media_type == "document" and media_file_id:
+        await bot.send_document(document=media_file_id, caption=text, **send_kwargs)
     
-    # Mode publication
-    if prefs.publish_mode and prefs.target_chat_id:
-        try:
-            await context.bot.send_message(
-                chat_id=prefs.target_chat_id,
-                text=processed_text
-            )
-            await update.message.reply_text("✅ Message publié dans le canal!")
-            
-            with get_db() as db:
-                user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
-                if user_prefs:
-                    user_prefs.messages_processed += 1
-        
-        except TelegramError as e:
-            logger.error(f"Erreur publication: {e}")
-            await update.message.reply_text(
-                f"❌ <b>Erreur lors de la publication:</b>\n{str(e)}\n\n"
-                "Vérifiez que le bot est administrateur du canal.",
-                parse_mode="HTML"
-            )
-            
-            with get_db() as db:
-                user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
-                if user_prefs:
-                    user_prefs.messages_failed += 1
+    elif media_type == "audio" and media_file_id:
+        await bot.send_audio(audio=media_file_id, caption=text, **send_kwargs)
+    
+    elif media_type == "voice" and media_file_id:
+        await bot.send_voice(voice=media_file_id, caption=text, **send_kwargs)
+    
+    elif media_type == "animation" and media_file_id:
+        await bot.send_animation(animation=media_file_id, caption=text, **send_kwargs)
+    
+    elif media_type == "sticker" and media_file_id:
+        # Les stickers ne supportent pas de caption
+        await bot.send_sticker(sticker=media_file_id, **send_kwargs)
+        # Envoyer le texte séparément si nécessaire
+        if text and text != "[Sticker]":
+            await bot.send_message(text=text, chat_id=chat_id)
+    
     else:
-        # Réponse dans le même chat
-        await update.message.reply_text(processed_text)
-        
-        with get_db() as db:
-            user_prefs = db.query(UserPreferences).filter(UserPreferences.user_id == prefs.user_id).first()
-            if user_prefs:
-                user_prefs.messages_processed += 1
+        # Fallback: envoyer juste le texte
+        await bot.send_message(text=text, **send_kwargs)
 
 
 async def safe_edit_message(query, text: str, markup, **kwargs):
-    """Édite un message de manière sécurisée"""
+    """Édite un message de manière sécurisée (caption ou texte)"""
     try:
-        # Essayer d'éditer le caption (si c'est une photo)
         await query.edit_message_caption(
             caption=text,
             reply_markup=markup,
@@ -762,7 +719,6 @@ async def safe_edit_message(query, text: str, markup, **kwargs):
         )
     except:
         try:
-            # Sinon éditer le texte
             await query.edit_message_text(
                 text=text,
                 reply_markup=markup,
@@ -891,54 +847,3 @@ async def reset_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     
     update_user_activity(user_id)
-
-
-async def handle_menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Gestion des callbacks des menus"""
-    user_id = update.effective_user.id
-    query = update.callback_query
-    data = query.data
-    
-    with get_db() as db:
-        prefs = db.query(UserPreferences).filter(UserPreferences.user_id == user_id).first()
-        
-        if not prefs:
-            await safe_edit_message(query, "❌ Aucune donnée disponible. Utilisez /start pour commencer.", None, parse_mode="HTML")
-            return
-        
-        if data == "menu_prefix":
-            text = "📝 <b>Gestion du Préfixe</b>\n\n"
-            text += f"<i>Actuel:</i> <code>{prefs.prefix or '(vide)'}</code>\n\n"
-            text += "Le préfixe est ajouté au début de chaque message."
-            await safe_edit_message(query, text, get_prefix_menu(prefs.prefix), parse_mode="HTML")
-        
-        elif data == "menu_suffix":
-            text = "📌 <b>Gestion du Suffixe</b>\n\n"
-            text += f"<i>Actuel:</i> <code>{prefs.suffix or '(vide)'}</code>\n\n"
-            text += "Le suffixe est ajouté à la fin de chaque message."
-            await safe_edit_message(query, text, get_suffix_menu(prefs.suffix), parse_mode="HTML")
-        
-        elif data == "menu_keyword_find":
-            text = "📝 <b>Gestion du Mot-clé</b>\n\n"
-            text += f"<i>Actuel:</i> <code>{prefs.keyword_find or '(vide)'}</code>\n\n"
-            text += "Le mot-clé est recherché et remplacé."
-            await safe_edit_message(query, text, get_keyword_find_menu(prefs.keyword_find), parse_mode="HTML")
-        
-        elif data == "menu_keyword_replace":
-            text = "📝 <b>Gestion du Remplacement</b>\n\n"
-            text += f"<i>Actuel:</i> <code>{prefs.keyword_replace or '(vide)'}</code>\n\n"
-            text += "Le mot-clé sera remplacé par ce texte."
-            await safe_edit_message(query, text, get_keyword_replace_menu(prefs.keyword_replace), parse_mode="HTML")
-        
-        elif data == "menu_publish":
-            text = "📢 <b>Mode Publication</b>\n\n"
-            text += f"<i>Actuel:</i> <code>{prefs.publish_mode}</code>\n\n"
-            text += "Vos messages seront publiés dans le canal."
-            await safe_edit_message(query, text, get_publish_menu(prefs.publish_mode, str(prefs.target_chat_id) if prefs.target_chat_id else ""), parse_mode="HTML")
-        
-        elif data == "menu_bulk":
-            text = "⚡ <b>Traitement Massif</b>\n\n"
-            text += f"<i>Actuel:</i> <code>{prefs.buffer_mode}</code>\n\n"
-            text += "Traitez jusqu'à 100 messages d'un coup!"
-            await safe_edit_message(query, text, get_bulk_menu(prefs.buffer_mode, len(get_buffer_messages(user_id))), parse_mode="HTML")
-            

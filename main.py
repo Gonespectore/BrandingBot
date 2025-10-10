@@ -4,15 +4,14 @@ from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
-    CallbackQueryHandler, ContextTypes
+    CallbackQueryHandler, ContextTypes, filters
 )
-import telegram.ext as tgf
 from contextlib import asynccontextmanager
 
 from db import get_db, UserPreferences
 from handlers import (
-    start, button_callback, handle_text_input,
-    stats_command, reset_command, handle_all_messages
+    start, button_callback, handle_all_messages,
+    stats_command, reset_command
 )
 
 # --- Configuration ---
@@ -54,28 +53,31 @@ async def lifespan(app: FastAPI):
         application = Application.builder().token(TELEGRAM_TOKEN).build()
         
         # Enregistrer les handlers
-        # Capture TOUS les messages sauf les commandes
+        # Capture TOUS les messages (texte, médias, etc.) sauf les commandes
         all_media_filters = (
-            tgf.filters.TEXT |
-            tgf.filters.PHOTO |
-            tgf.filters.VIDEO |
-            tgf.filters.DOCUMENT |
-            tgf.filters.AUDIO |
-            tgf.filters.VOICE |
-            tgf.filters.CONTACT |
-            tgf.filters.LOCATION |
-            tgf.filters.STICKER |
-            tgf.filters.ANIMATION
+            filters.TEXT |
+            filters.PHOTO |
+            filters.VIDEO |
+            filters.DOCUMENT |
+            filters.AUDIO |
+            filters.VOICE |
+            filters.CONTACT |
+            filters.LOCATION |
+            filters.STICKER |
+            filters.ANIMATION
         )
+        
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", start))
         application.add_handler(CommandHandler("stats", stats_command))
         application.add_handler(CommandHandler("reset", reset_command))
         application.add_handler(CallbackQueryHandler(button_callback))
+        
+        # Handler universel pour TOUS les messages non-commandes
         application.add_handler(MessageHandler(
-                (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.DOCUMENT | filters.AUDIO) & ~filters.COMMAND,
+            all_media_filters & ~filters.COMMAND,
             handle_all_messages
-    ))
+        ))
         
         # CRITIQUE: Pour webhook, seulement initialize() - PAS start()
         await application.initialize()
@@ -201,6 +203,8 @@ async def health_check():
 @app.get("/stats")
 async def global_stats():
     """Statistiques globales du bot"""
+    from sqlalchemy import func
+    
     try:
         with get_db() as db:
             total_users = db.query(UserPreferences).count()
@@ -289,10 +293,6 @@ async def global_exception_handler(request: Request, exc: Exception):
         "message": str(exc),
         "path": str(request.url)
     }
-
-
-# --- Import pour les stats ---
-from sqlalchemy import func
 
 
 # --- Point d'entrée ---
