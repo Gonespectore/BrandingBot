@@ -70,7 +70,7 @@ async def lifespan(app: FastAPI):
             filters.TEXT |
             filters.PHOTO |
             filters.VIDEO |
-            filters.DOCUMENT |  # ← TOUT EN MAJUSCULES
+            filters.Document |  # ← Le seul avec un majuscule initial !
             filters.AUDIO |
             filters.VOICE |
             filters.CONTACT |
