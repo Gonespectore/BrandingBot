@@ -55,16 +55,16 @@ async def lifespan(app: FastAPI):
         # Enregistrer les handlers
         # Capture TOUS les messages sauf les commandes
         all_media_filters = (
-            filters.TEXT | 
-            filters.PHOTO | 
-            filters.VIDEO | 
-            filters.DOCUMENT | 
-            filters.AUDIO | 
-            filters.VOICE | 
-            filters.CONTACT | 
-            filters.LOCATION | 
-            filters.STICKER | 
-            filters.ANIMATION
+            filters.Text |
+            filters.Photo |
+            filters.Video |
+            filters.Document |
+            filters.Audio |
+            filters.Voice |
+            filters.Contact |
+            filters.Location |
+            filters.Sticker |
+            filters.Animation
         )
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", start))
