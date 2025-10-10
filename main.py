@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from db import get_db, UserPreferences
 from handlers import (
     start, button_callback, handle_text_input,
-    stats_command, reset_command
+    stats_command, reset_command, handle_all_messages
 )
 
 # --- Configuration ---
