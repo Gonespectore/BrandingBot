@@ -55,23 +55,26 @@ async def lifespan(app: FastAPI):
         # Enregistrer les handlers
         # Capture TOUS les messages sauf les commandes
         all_media_filters = (
-            filters.TEXT | 
-            filters.PHOTO | 
-            filters.VIDEO | 
-            filters.DOCUMENT | 
-            filters.AUDIO | 
-            filters.VOICE | 
-            filters.CONTACT | 
-            filters.LOCATION | 
-            filters.STICKER | 
-            filters.ANIMATION
+            filters.Text |
+            filters.Photo |
+            filters.Video |
+            filters.Document |
+            filters.Audio |
+            filters.Voice |
+            filters.Contact |
+            filters.Location |
+            filters.Sticker |
+            filters.Animation
         )
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", start))
         application.add_handler(CommandHandler("stats", stats_command))
         application.add_handler(CommandHandler("reset", reset_command))
         application.add_handler(CallbackQueryHandler(button_callback))
-        application.add_handler(MessageHandler(all_media_filters & ~filters.COMMAND, handle_all_messages))
+        application.add_handler(MessageHandler(
+                (filters.TEXT | filters.PHOTO | filters.VIDEO | filters.DOCUMENT | filters.AUDIO) & ~filters.COMMAND,
+            handle_all_messages
+    ))
         
         # CRITIQUE: Pour webhook, seulement initialize() - PAS start()
         await application.initialize()
