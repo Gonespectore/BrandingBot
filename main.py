@@ -282,7 +282,14 @@ from sqlalchemy import func
 if __name__ == "__main__":
     import uvicorn
     
-    port = int(os.getenv("PORT", 8000))
+    raw_port = os.getenv("PORT")
+    if raw_port is None or raw_port == "":
+        raise RuntimeError("❌ La variable d'environnement PORT est manquante ou vide. Railway doit la fournir.")
+    
+    try:
+        port = int(raw_port)
+    except ValueError:
+        raise RuntimeError(f"❌ PORT invalide: '{raw_port}'. Doit être un nombre entier.")
     
     logger.info(f"🚀 Démarrage sur le port {port}")
     
