@@ -4,8 +4,9 @@ from fastapi import FastAPI, Request, HTTPException
 from telegram import Update
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, 
-    CallbackQueryHandler, filters
+    CallbackQueryHandler, ContextTypes
 )
+import telegram.ext as tgf
 from contextlib import asynccontextmanager
 
 from db import get_db, UserPreferences
@@ -55,16 +56,16 @@ async def lifespan(app: FastAPI):
         # Enregistrer les handlers
         # Capture TOUS les messages sauf les commandes
         all_media_filters = (
-            filters.Text |
-            filters.Photo |
-            filters.Video |
-            filters.Document |
-            filters.Audio |
-            filters.Voice |
-            filters.Contact |
-            filters.Location |
-            filters.Sticker |
-            filters.Animation
+            tgf.filters.TEXT |
+            tgf.filters.PHOTO |
+            tgf.filters.VIDEO |
+            tgf.filters.DOCUMENT |
+            tgf.filters.AUDIO |
+            tgf.filters.VOICE |
+            tgf.filters.CONTACT |
+            tgf.filters.LOCATION |
+            tgf.filters.STICKER |
+            tgf.filters.ANIMATION
         )
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", start))
